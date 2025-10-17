@@ -1,0 +1,20 @@
+{"fields":
+	{"project":
+    {"key":"DPT"},
+    "description":"This is the Description: Resilience TEST.0003 on LAC.0001 for services A/B/C",
+    "summary":"This is the summary: DIGITAL - TEST.0003 on LAC.0001",
+    "issuetype":{"id":"13032"}
+	},
+  "xrayFields":{"environments":["PP"] },
+  "stream":"DIGITAL",
+  "test":{
+    "resilience": {
+      "tool": "chaostoolkit",
+      "parameters":" ",
+      "test_type":"resilience-test",
+      "test_definition_file": "resilience-test.json",
+      "dashboard_url":"https://onenr.io/0dQe78egdRe",
+      "location":"on-premise-vm"
+    }
+  }
+} 

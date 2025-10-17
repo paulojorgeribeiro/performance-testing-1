@@ -1,0 +1,62 @@
+name: LAC.0004-TEST.0001-FAKE.0001
+
+on:
+  workflow_dispatch
+
+jobs:
+  fake-test:
+    runs-on: self-hosted
+    steps:
+    - name: Defining test specific environment variables
+      run: |
+        echo "LAC_ID=LAC.0004" >> $GITHUB_ENV
+        echo "TEST_ID=TEST.0001" >> $GITHUB_ENV
+        echo "JMX_FILE=default.jmx" >> $GITHUB_ENV
+        echo "CSV_FILE=test-data-001.csv" >> $GITHUB_ENV
+        echo "CONTAINER_NAME=jmeter-lac0004-test0001" >> $GITHUB_ENV
+        echo "STREAM=CUSTOMER" >> $GITHUB_ENV
+        echo "TEST_TYPE=fake-test" >> $GITHUB_ENV
+        echo "ENVIRONMENT=PP" >> $GITHUB_ENV
+        echo "FACTOR=0.5" >> $GITHUB_ENV
+        echo "DASHBOARD_URL=https://onenr.io/0dQe78egdRe" >> $GITHUB_ENV
+        echo "LOCATION=on-premise-vm" >> $GITHUB_ENV
+        echo "EXECUTION_TYPE=distributed" >> $GITHUB_ENV
+        echo 'WORKERS=["dcvx-jmtapp-g2", "dcvx-jmtapp-g3"]' >> $GITHUB_ENV
+        echo "TOOL=jmeter" >> $GITHUB_ENV
+        echo "SCRIPT_VERSION=1.2.0" >> $GITHUB_ENV
+
+    - name: Registering the test run
+      id: register
+      run: |
+        response=$(curl -s -X 'POST' 'http://dcvx-jmtapp-g1.mch.moc.sgps:8000/v2/register' \
+          -H 'accept: application/json' \
+          -H 'Content-Type: application/json' \
+          -d '{ "repo": "${{ github.repository }}", "lac": "${{ env.LAC_ID }}", "stream": "${{ env.STREAM }}", "test": "${{ env.TEST_ID }}", "type": "${{ env.TEST_TYPE }}", "environment": "${{ env.ENVIRONMENT }}", "triggered_by": "${{ github.actor }}", "factor": "${{ env.FACTOR }}", "dashboard_url": "${{ env.DASHBOARD_URL }}", "location": "${{ env.LOCATION }}", "container_name": "${{ env.CONTAINER_NAME }}", "execution_type": "${{ env.EXECUTION_TYPE }}", "workers": ${{ env.WORKERS }}, "tool": "${{ env.TOOL }}", "script_version": "${{ env.SCRIPT_VERSION }}" }') 
+        echo "Response: $response"
+
+        message=$(echo "$response" | jq -r '.message')
+        run_id=$(echo "$response" | jq -r '.run_id')
+        test_id=$(echo "$response" | jq -r '.test_id')
+
+        echo "run_id=$run_id" >> $GITHUB_OUTPUT      
+
+        if [ "$message" == "Test registered" ]; then
+          echo "Test run registered successfully with run_id: $run_id and test_id: $test_id"
+        else
+          echo "Failed to register test run: $message"
+          exit 1
+        fi
+    
+    - name: Pretending I'm running a test
+      run: |
+        echo "I almost ran the performance test TEST.0001-FAKE.0001 on LAC.0004!"
+
+    - name: Completing the test run
+      run: |     
+        curl -s -X 'POST' "http://dcvx-jmtapp-g1.mch.moc.sgps:8000/v2/complete" \
+          -H 'accept: application/json' \
+          -H 'Content-Type: application/json' \
+          -d "{ \"run_id\": ${{ steps.register.outputs.run_id }}, \"status\": \"success\" }"
+          
+
+

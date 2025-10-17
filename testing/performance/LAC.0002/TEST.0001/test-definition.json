@@ -1,0 +1,23 @@
+{"fields":
+	{"project":
+			{"key":"DPT"},
+			"description":"This is the Description: Load Test TEST.0001 on LAC.0002 for services A/B/C",
+			"summary":"This is the summary: DIGITAL - TEST.0001 on LAC.0002",
+			"issuetype":{"id":"13032"}
+	},
+  "xrayFields":{"environments":["PP"] },
+  "stream":"CUSTOMER",
+  "test": {
+    "performance":{
+        "tool":"jmeter",
+        "parameters":"",
+        "test_definition_file":"soak-test.jmx",
+        "test_data_file":"test-data-001.csv",
+        "test_type":"soak-test",
+        "dashboard_url":"https://onenr.io/0dQe78egdRe",
+        "location":"on-premise-vm",
+        "factor":"2.0",
+		    "execution_type":"standalone"
+    }
+  }
+}

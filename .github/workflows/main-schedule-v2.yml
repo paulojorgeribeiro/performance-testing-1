@@ -1,0 +1,32 @@
+name: Main Schedule Workflow v2
+
+on:
+  schedule:
+    - cron: '0,30 * * * *'  # Runs every 30 minutes
+  workflow_dispatch:  # Allows manual triggering
+
+env:
+  TIME_WINDOW_MINUTES: 15  # Global workflow variable
+
+jobs:
+  scheduled-performance-test:
+    runs-on: self-hosted
+    timeout-minutes: 60  # Set timeout to 60 minutes (1 hour)
+    
+    steps:
+    - name: Running test  
+      run: |
+        echo "Checking for scheduled tests to run in the last ${{ env.TIME_WINDOW_MINUTES }} minutes"
+        
+        ${HOME}/run-test-scheduled.sh \
+          "${{ secrets.GITHUB_TOKEN }}" \
+          "${{ github.repository }}" \
+          "${{ vars.PERFORMANCE_HOME }}" \
+          "${{ vars.SCHEDULE_FILE_NAME }}" \
+          "${{ env.TIME_WINDOW_MINUTES }}" \
+          "${{ github.ref_name }}" \
+
+        if [ $? -ne 0 ]; then
+          echo "Schedule validation failed"
+          exit 1
+        fi

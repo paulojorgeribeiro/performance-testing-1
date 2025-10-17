@@ -1,0 +1,93 @@
+name: Build and Push JMeter Docker Image
+
+on:
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  TARGET_OWNER: santoae_sonaemc
+  IMAGE_TAG: latest
+  IMAGE_NAME: jmeter 
+  CONTEXT: Dockerfiles/jmeter 
+  DOCKERFILE: Dockerfiles/jmeter/Dockerfile 
+  MANIFEST_REPO: santoae_sonaemc/jmeter-manifests
+  MANIFEST_PATH: apps/jmeter/deployment.yaml
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ env.TARGET_OWNER }}
+          password: ${{ secrets.GHCR_PAT }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.TARGET_OWNER }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ env.IMAGE_TAG }}
+
+      - name: Build and push Docker image
+        run: |
+          set -e
+          echo "Building $IMAGE_NAME from $DOCKERFILE"
+          docker buildx build \
+            --push \
+            --file "$DOCKERFILE" \
+            --tag "${{ steps.meta.outputs.tags }}" \
+            "$CONTEXT"
+          echo "Built and pushed: $REGISTRY/$TARGET_OWNER/$IMAGE_NAME:$IMAGE_TAG"
+
+      - name: Output image details
+        run: |
+          echo "Image built and pushed successfully!"
+          echo "Tags: ${{ steps.meta.outputs.tags }}"
+
+  update-manifest:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout manifest repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.MANIFEST_REPO }}
+          token: ${{ secrets.GHCR_PAT }}  
+          path: manifests
+
+      - name: Update image tag in manifest
+        run: |
+          cd manifests
+          IMAGE_TAG="${{ env.IMAGE_TAG }}"
+          IMAGE_FULL="${{ env.REGISTRY }}/${{ env.TARGET_OWNER }}/${{ env.IMAGE_NAME }}:${IMAGE_TAG}"
+          
+          # Update deployment.yaml with new image
+          sed -i "s|image: .*|image: ${IMAGE_FULL}|g" ${{ env.MANIFEST_PATH }}
+          
+          echo "Updated image to: ${IMAGE_FULL}"
+
+      - name: Commit and push changes
+        run: |
+          cd manifests
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add ${{ env.MANIFEST_PATH }}
+          git commit -m "Update image to ${{ needs.build-and-push.outputs.image_tag }}" || echo "No changes"
+          git push

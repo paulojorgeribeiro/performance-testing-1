@@ -1,0 +1,43 @@
+name: Write Schedule to File
+
+on:
+  workflow_dispatch:
+    inputs:
+      schedule_time:
+        description: 'Schedule in format DD-MM-YYYY:HH24:MI'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  write-schedule:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Write schedule to file
+        run: |
+          mkdir -p testing/performance
+          echo "Schedule: ${{ inputs.schedule_time }}" >> testing/performance/schedule2.txt
+
+      - name: Create new branch and commit
+        run: |
+          BRANCH_NAME="update-schedule-$(date +%Y%m%d-%H%M%S)"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b $BRANCH_NAME
+          git add testing/performance/schedule2.txt
+          git diff --staged --quiet || git commit -m "Update schedule to ${{ inputs.schedule_time }}"
+          git push origin $BRANCH_NAME
+      
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v5
+        with:
+          branch: update-schedule-${{ github.run_number }}
+          base: main
+          title: "Update schedule to ${{ inputs.schedule_time }}"
+          body: |
+            This PR updates the schedule to ${{ inputs.schedule_time }}.

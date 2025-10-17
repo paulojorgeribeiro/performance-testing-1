@@ -1,0 +1,4 @@
+Host *
+  IdentityFile ~/.ssh/id_rsa
+  CertificateFile ~/.ssh/id_rsa_cert.pub
+  IdentitiesOnly yes

@@ -1,0 +1,32 @@
+name: Local Runner VM Test
+
+on:
+  workflow_dispatch
+
+jobs:
+  ssh-job:
+    runs-on: self-hosted
+    timeout-minutes: 60  # Set timeout to 60 minutes (1 hours)
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+    
+    - run: echo "🖥️ Installing SSH Client."
+    
+    - name: Install SSH client
+      run: sudo apt-get install -y openssh-client
+
+    - name: Copy files to SSH host
+      run: |
+        echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/private_key
+        chmod 600 /tmp/private_key
+      
+    - name: Connect to remote server and execute commands
+      uses: appleboy/ssh-action@v0.1.5
+      with:
+        host: ${{ secrets.SSH_HOST }}
+        username: ${{ secrets.SSH_USER }}
+        key: ${{ secrets.SSH_PRIVATE_KEY }}
+        script: |
+          echo "Finished Testing"

@@ -1,0 +1,48 @@
+name: Performance Test
+description: Run performance tests on the specified LAC and TEST ID.
+
+on:
+  workflow_dispatch:
+    inputs:
+      LAC_ID:
+        description: 'The LAC identifier'
+        required: true
+        default: '<insert LAC.ID here>'
+      TEST_ID:
+        description: 'The Test identifier'
+        required: true
+        default: '<insert TEST.ID here>'
+
+jobs:
+  performance-test:
+    runs-on: self-hosted
+    timeout-minutes: 600  # Set timeout to 600 minutes (10 hour)
+    
+    steps:
+    - name: Running test  
+      run: |
+        echo "Running performance test ${{ github.event.inputs.TEST_ID }} on LAC ${{ github.event.inputs.LAC_ID }}"
+        
+        ${HOME}/run-test.sh \
+          "${{ secrets.GITHUB_TOKEN }}" \
+          "${{ github.repository }}" \
+          "${{ github.event.inputs.LAC_ID }}" \
+          "${{ github.event.inputs.TEST_ID }}" \
+          "${{ vars.PERFORMANCE_HOME }}" \
+          "${{ github.actor }}" \
+          "${{ github.ref_name }}" \
+          "${{ secrets.VAULT_TOKEN }}" \
+          "${{ env.AUTHENTICATION }}"
+
+        if [ $? -ne 0 ]; then
+          echo "Performance test failed"
+          exit 1
+        fi
+
+    - name: Cleanup remote job
+      if: ${{ always() }}
+      run: |
+        ${HOME}/cleanup-remote-job.sh \
+          "${{ github.event.inputs.LAC_ID }}" \
+          "${{ github.event.inputs.TEST_ID }}" \
+          "${{ secrets.VAULT_TOKEN }}"

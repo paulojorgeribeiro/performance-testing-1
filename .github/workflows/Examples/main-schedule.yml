@@ -1,0 +1,303 @@
+name: Main Schedule Workflow
+
+on:
+  schedule:
+    - cron: '0,30 * * * *'  # Runs every 30 minutes
+  workflow_dispatch:  # Allows manual triggering
+
+env:
+  TIME_WINDOW_MINUTES: 15  # Global workflow variable
+
+jobs:
+  read-schedule:
+    runs-on: self-hosted
+    outputs:
+      workflow_names: ${{ steps.set-workflow.outputs.workflow_names }} 
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Check if schedule file exists
+        id: check-file
+        run: |
+            if [ ! -f "${{ vars.PERFORMANCE_HOME }}/${{ vars.SCHEDULE_FILE_NAME }}" ]; then
+            echo "Schedule file not found. Exiting gracefully."
+            exit 0
+            fi
+
+      - name: Read schedule file
+        id: read-schedule
+        run: |
+          # Define time window variable from environment
+          TIME_WINDOW=$TIME_WINDOW_MINUTES
+          echo "Using time window of $TIME_WINDOW minutes"
+          
+          current_time=$(date +'%M %H %d %m %u' | sed 's/^0*//g')
+          echo "Current time: $current_time"
+          schedule_file="${{ vars.PERFORMANCE_HOME }}/${{ vars.SCHEDULE_FILE_NAME }}"
+          # Initialize an array to store matching workflows
+          matching_workflows=()
+
+          # Function to match time with wildcard support and time window
+          match_time() {
+            IFS=' ' read -r -a current <<< "$1"
+            IFS=' ' read -r -a schedule <<< "$2"
+
+            # Print debug information
+            echo "Matching current time: ${current[*]} against schedule: ${schedule[*]}"
+
+            # Ensure we have valid numeric values and remove leading zeros
+            current_min=$(echo "${current[0]:-0}" | sed 's/^0*//')
+            current_hour=$(echo "${current[1]:-0}" | sed 's/^0*//')
+            
+            # Handle empty strings after removing zeros
+            current_min=${current_min:-0}
+            current_hour=${current_hour:-0}
+            
+            # Check if minutes field matches (either wildcard or within range)
+            if [[ "${schedule[0]}" == "%" ]]; then
+              minutes_match=true
+              echo "Minutes match: true (wildcard)"
+            else
+              schedule_min=$(echo "${schedule[0]:-0}" | sed 's/^0*//')
+              schedule_min=${schedule_min:-0}
+              
+              # Calculate absolute difference between minutes
+              if [[ $current_min -ge $schedule_min ]]; then
+                min_diff=$(( current_min - schedule_min ))
+              else
+                min_diff=$(( 60 - schedule_min + current_min ))
+              fi
+              
+              echo "Current min: $current_min, Schedule min: $schedule_min, Diff: $min_diff, Window: $TIME_WINDOW"
+              
+              if [[ $min_diff -le $TIME_WINDOW ]]; then
+                minutes_match=true
+                echo "Minutes match: true (within window)"
+              else
+                minutes_match=false
+                echo "Minutes match: false (outside window)"
+              fi
+            fi
+            
+            # Check if hours match (either wildcard or exact match)
+            if [[ "${schedule[1]}" == "%" ]]; then
+              hours_match=true
+              echo "Hours match: true (wildcard)"
+            else
+              schedule_hour=$(echo "${schedule[1]:-0}" | sed 's/^0*//')
+              schedule_hour=${schedule_hour:-0}
+              
+              # If we're close to the hour boundary and the scheduled minute is near the end of the hour
+              if [[ $current_min -lt $TIME_WINDOW && $schedule_min -ge $(( 60 - $TIME_WINDOW )) ]]; then
+                # Check if the current hour is one more than the scheduled hour (with wraparound at 24)
+                if [[ $(( (current_hour - 1 + 24) % 24 )) -eq $schedule_hour ]]; then
+                  hours_match=true
+                  echo "Hours match: true (considering hour boundary)"
+                else
+                  hours_match=false
+                  echo "Hours match: false (hour boundary check failed)"
+                fi
+              # Normal hour check
+              elif [[ $current_hour -eq $schedule_hour ]]; then
+                hours_match=true
+                echo "Hours match: true"
+              else
+                hours_match=false
+                echo "Hours match: false"
+              fi
+            fi
+            
+            # Only proceed if both minutes and hours match
+            if [[ $minutes_match == true && $hours_match == true ]]; then
+              # Continue checking other fields (day, month, day of the week)
+              for i in {2..4}; do
+                if [[ "${schedule[i]}" != "%" && "${schedule[i]}" != "${current[i]}" ]]; then
+                  echo "Field $i doesn't match: ${schedule[i]} vs ${current[i]}"
+                  return 1
+                fi
+              done
+              echo "All fields match!"
+              return 0
+            fi
+
+            return 1
+          }
+
+          # Helper function to calculate days in a month
+          cal_days_in_month() {
+            month=$1
+            case $month in
+              1|3|5|7|8|10|12) echo 31 ;;
+              4|6|9|11) echo 30 ;;
+              2)
+                year=$(date +%Y)
+                if (( (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 )); then
+                  echo 29
+                else
+                  echo 28
+                fi
+                ;;
+            esac
+          }
+
+          while IFS= read -r line || [[ -n "$line" ]]; do
+            # Ignore lines starting with '#'
+            if [[ "$line" =~ ^# ]]; then
+              continue
+            fi
+
+            echo "Raw schedule line: $line"
+            schedule_time=$(echo $line | cut -d ' ' -f 1-5)
+            workflow=$(echo $line | cut -d ' ' -f 6- | tr -d '"')
+
+            echo "Checking schedule time: $schedule_time"
+            echo "Workflow: $workflow"
+            if match_time "$current_time" "$schedule_time"; then
+              echo "Match found for workflow: $workflow"
+              matching_workflows+=("$workflow")
+            fi
+          done < "$schedule_file"
+      
+          if [ ${#matching_workflows[@]} -eq 0 ]; then
+            echo "No workflows to trigger."
+            # Set an empty array output
+            echo "matching_workflows=[]" >> $GITHUB_OUTPUT
+          else
+            echo "Found ${#matching_workflows[@]} matching workflows"
+            # Create a comma-separated list instead of a JSON array
+            workflow_list=$(printf "%s," "${matching_workflows[@]}")
+            workflow_list=${workflow_list%,}  # Remove trailing comma
+            echo "matching_workflows=$workflow_list" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set workflow output
+        id: set-workflow
+        run: |
+          workflows="${{ steps.read-schedule.outputs.matching_workflows }}"
+          if [[ "$workflows" == "[]" ]]; then
+            echo "workflow_names=[]" >> $GITHUB_OUTPUT
+          else
+            # Make sure we treat each workflow name as a separate JSON string
+            # First, split by commas if there are multiple workflows
+            IFS=',' read -ra workflow_array <<< "$workflows"
+            
+            # Create a properly formatted JSON array with each name as a string
+            # Use jq to ensure well-formed JSON
+            json_array=$(printf '%s\n' "${workflow_array[@]}" | jq -R . | jq -s -c .)
+            echo "Generated JSON array: $json_array"
+            echo "workflow_names=$json_array" >> $GITHUB_OUTPUT
+          fi
+
+  get-workflow-ids:
+    needs: read-schedule
+    runs-on: self-hosted
+    if: ${{ needs.read-schedule.outputs.workflow_names != '[]' }}
+    outputs:
+      workflow_ids: ${{ steps.get-workflow-ids.outputs.workflow_ids }}
+    steps:
+      - name: Debug workflow names
+        run: |
+          echo "Workflow Names: ${{ needs.read-schedule.outputs.workflow_names }}"
+
+      - name: Get workflow IDs by name
+        id: get-workflow-ids
+        run: |
+          # Use GitHub context variables for repository information
+          repo_owner=$(echo "${{ github.repository }}" | cut -d '/' -f 1)
+          repo_name=$(echo "${{ github.repository }}" | cut -d '/' -f 2)
+          
+          # Get the list of workflows
+          response=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/$repo_owner/$repo_name/actions/workflows")
+    
+          # Capture the workflow names from the previous job
+          workflow_names='${{ needs.read-schedule.outputs.workflow_names }}'
+          echo "Raw workflow names: $workflow_names"
+          
+          # Check if the input is valid JSON
+          if ! echo "$workflow_names" | jq . >/dev/null 2>&1; then
+            echo "Warning: Invalid JSON received. Attempting to fix..."
+            # Try to fix malformed JSON
+            workflow_names="[\"$(echo "$workflow_names" | sed 's/\[//g' | sed 's/\]//g' | sed 's/,/","/g')\"]"
+            echo "Fixed workflow names: $workflow_names"
+          fi
+          
+          # Handle workflows directly as a JSON array
+          if [[ "$workflow_names" == "[]" ]]; then
+            echo "No workflows to process"
+            workflow_ids="[]"
+            echo "workflow_ids=$workflow_ids" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Initialize an array for workflow IDs
+          workflow_ids=()
+          
+          # Process each workflow name using jq's --arg for safe handling
+          while read -r workflow_name; do
+            if [[ -z "$workflow_name" ]]; then
+              continue
+            fi
+            echo "Looking for workflow: $workflow_name"
+            id=$(echo "$response" | jq --arg name "$workflow_name" -r '.workflows[] | select(.name == $name) | .id')
+            if [[ -n "$id" ]]; then
+              echo "Found ID for $workflow_name: $id"
+              workflow_ids+=($id)
+            else
+              echo "No workflow found with name: $workflow_name"
+            fi
+          done < <(echo "$workflow_names" | jq -r '.[]')
+          
+          # Create output
+          if [[ ${#workflow_ids[@]} -eq 0 ]]; then
+            echo "No workflow IDs found"
+            echo "workflow_ids=[]" >> $GITHUB_OUTPUT
+          else
+            # Convert array to JSON array with compact formatting (-c flag)
+            json_ids=$(printf '%s\n' "${workflow_ids[@]}" | jq -R . | jq -s -c .)
+            echo "Found workflow IDs JSON: $json_ids"
+            # Use both output methods to ensure compatibility
+            echo "workflow_ids=$json_ids" >> $GITHUB_OUTPUT
+          fi
+
+  trigger-workflows:
+    needs: get-workflow-ids
+    runs-on: self-hosted
+    if: ${{ needs.get-workflow-ids.outputs.workflow_ids != '[]' }}
+    steps:
+      - name: Confirm workflows to trigger
+        run: |
+          echo "Triggering workflows with IDs: ${{ needs.get-workflow-ids.outputs.workflow_ids }}"
+          
+      - name: Trigger workflows
+        run: |
+          # Use GitHub context variables for repository information
+          repo_owner=$(echo "${{ github.repository }}" | cut -d '/' -f 1)
+          repo_name=$(echo "${{ github.repository }}" | cut -d '/' -f 2)
+    
+          # Capture the IDs and ensure we have valid JSON
+          echo '${{ needs.get-workflow-ids.outputs.workflow_ids }}' > /tmp/workflow_ids.json
+          
+          # Check if the file exists and has content
+          if [ -s /tmp/workflow_ids.json ]; then
+            echo "Processing workflow IDs from file:"
+            cat /tmp/workflow_ids.json
+            
+            # Process each workflow ID
+            while read -r workflow_id; do
+              if [[ -n "$workflow_id" ]]; then
+                echo "Triggering workflow with ID: $workflow_id"
+                curl -s -X POST -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                  -H "Accept: application/vnd.github.v3+json" \
+                  "https://api.github.com/repos/$repo_owner/$repo_name/actions/workflows/$workflow_id/dispatches" \
+                  -d '{"ref":"${{ github.ref_name }}"}'
+                echo ""
+                # Add a small delay between API calls to avoid rate limiting
+                sleep 1
+              fi
+            done < <(jq -r '.[]' /tmp/workflow_ids.json)
+          else
+            echo "No workflow IDs file found or file is empty"
+          fi

@@ -1,0 +1,64 @@
+name: Local Runner Example
+
+on:
+  workflow_dispatch
+
+jobs:
+  ssh-job:
+    runs-on: self-hosted
+    steps:
+    - name: Defining test specific environment variables
+      run: |
+          echo "LAC_ID=LAC.0001" >> $GITHUB_ENV
+          echo "TEST_ID=TEST.0001" >> $GITHUB_ENV
+          echo "TEST_DEFINITION_FILE=default.jmx" >> $GITHUB_ENV
+          echo "TEST_DATA_FILE=test-data-001.csv" >> $GITHUB_ENV
+          echo "CONTAINER_NAME=jmeter-performance-testing" >> $GITHUB_ENV
+          echo "REPO=mcdigital-devplatforms/performance-testing" >> $GITHUB_ENV
+          echo "STREAM=DIGITAL" >> $GITHUB_ENV
+          echo "TEST_TYPE=load-test" >> $GITHUB_ENV
+          echo "ENVIRONMENT=PP" >> $GITHUB_ENV
+          echo "JMETER_PARAMS=-Jjmeter.save.saveservice.output_format=xml -Jjmeter.save.saveservice.timestamp_format=yyyy-MM-dd'T'HH:mm:ss.SSSZ" >> $GITHUB_ENV
+
+    - name: Running test  
+      run: |
+          echo "Running performance test ${{ env.TEST_ID }} on LAC ${{ env.LAC_ID }}"
+          
+          /home/ubuntu/run-test.sh \
+            "${{ secrets.TOKEN }}" \
+            "${{ env.REPO }}" \
+            "${{ env.TEST_DEFINITION_FILE }}" \
+            "${{ env.TEST_DATA_FILE }}" \
+            "${{ env.LAC_ID }}" \
+            "${{ env.TEST_ID }}" \
+            "${{ env.CONTAINER_NAME }}" \
+            "${{ vars.PERFORMANCE_HOME }}" \
+            "${{ env.JMETER_PARAMS }}" \
+            "${{ env.STREAM }}" \
+            "${{ env.TEST_TYPE }}" \
+            "${{ env.ENVIRONMENT }}" \
+            "${{ github.actor }}" \
+            "${{ secrets.SSH_USER }}" \
+            "${{ secrets.SSH_HOST }}"
+
+          if [ $? -ne 0 ]; then
+            echo "Performance test failed"
+            exit 1
+          fi
+
+    - name: Uploading results to repository
+      uses: actions/upload-artifact@v4
+      with:
+        name: jmeter-results-and-logs
+        path: |
+          results.jtl
+          jmeter.log
+          report.zip        
+        if-no-files-found: warn  # Just warn rather than fail if files aren't found
+
+    - name: Cleaning up
+      if: always()
+      run: |
+        ssh -q ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} <<EOF
+          rm -rf /home/${{ secrets.SSH_USER }}/${{ env.LAC_ID }}/${{ env.TEST_ID }}
+        EOF
