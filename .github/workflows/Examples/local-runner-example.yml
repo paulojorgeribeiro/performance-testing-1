@@ -14,7 +14,7 @@ jobs:
           echo "TEST_DEFINITION_FILE=default.jmx" >> $GITHUB_ENV
           echo "TEST_DATA_FILE=test-data-001.csv" >> $GITHUB_ENV
           echo "CONTAINER_NAME=jmeter-performance-testing" >> $GITHUB_ENV
-          echo "REPO=mcdigital-devplatforms/performance-testing" >> $GITHUB_ENV
+          echo "REPO=paulojorgeribeiro/performance-testing-1" >> $GITHUB_ENV
           echo "STREAM=DIGITAL" >> $GITHUB_ENV
           echo "TEST_TYPE=load-test" >> $GITHUB_ENV
           echo "ENVIRONMENT=PP" >> $GITHUB_ENV
