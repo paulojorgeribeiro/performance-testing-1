@@ -27,11 +27,17 @@ jobs:
       # 0) "docker" → Podman remoto (API do host na 8666)
       - name: Make docker shim for Podman (remote API)
         run: |
-          echo 'PODMAN_HOST=tcp://10.126.84.166:8666' >> "$GITHUB_ENV"
+          # Tenta o nome canónico; se falhar, usa o IP especial 10.0.2.2
+          echo 'PODMAN_HOST=tcp://host.containers.internal:8666' >> "$GITHUB_ENV"
           mkdir -p "$HOME/bin"
           cat > "$HOME/bin/docker" <<'SH'
           #!/usr/bin/env sh
-          exec podman --remote --url "$PODMAN_HOST" "$@"
+          # fallback automático se o DNS interno não existir
+          if podman --remote --url "$PODMAN_HOST" info >/dev/null 2>&1; then
+            exec podman --remote --url "$PODMAN_HOST" "$@"
+          else
+            exec podman --remote --url tcp://10.0.2.2:8666 "$@"
+          fi
           SH
           chmod +x "$HOME/bin/docker"
           echo "$HOME/bin" >> "$GITHUB_PATH"
@@ -83,3 +89,4 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           bash shell/cleanup-remote-job.sh "${{ inputs.LAC_ID }}" "${{ inputs.TEST_ID }}" "${{ secrets.VAULT_TOKEN }}"
+
