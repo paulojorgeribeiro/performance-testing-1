@@ -19,14 +19,7 @@ jobs:
     timeout-minutes: 600
 
     steps:
-      # 0) Sanity: confirmar runtime de contentores
-      - name: Sanity check (container runtime)
-        run: |
-          podman --version || true
-          docker --version || true
-          docker info || podman info
-
-      # 1) Shim para que 'docker ...' use Podman (sem sudo)
+      # 0) Preparação: garantir que 'docker' chama Podman (não requer sudo)
       - name: Make docker shim for Podman
         run: |
           mkdir -p "$HOME/bin"
@@ -37,21 +30,33 @@ jobs:
           chmod +x "$HOME/bin/docker"
           echo "$HOME/bin" >> "$GITHUB_PATH"
 
-      # 2) Trazer o código para o workspace do GitHub Actions
+      # 1) Clonar o repositório para $GITHUB_WORKSPACE
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 3) Garantir permissões de execução nos scripts
+      # 2) Sanity – confirmar runtime e paths
+      - name: Sanity check (container runtime & paths)
+        run: |
+          podman --version || true
+          docker --version || true
+          docker info || podman info
+          echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
+          ls -la "${GITHUB_WORKSPACE}/shell" || true
+
+      # 3) Permissões de execução
       - name: Make scripts executable
+        working-directory: ${{ github.workspace }}
         run: |
           chmod +x shell/run-test.sh || true
           chmod +x shell/run-test-performance-jmeter.sh || true
           chmod +x shell/cleanup-remote-job.sh || true
 
-      # 4) Executar o teste a partir do repositório (NÃO do $HOME)
+      # 4) Executar o teste: usar o REPO como PERFORMANCE_HOME
       - name: Running test
         env:
-          AUTHENTICATION: ${{ env.AUTHENTICATION }} # define em 'env:' global, variável de Actions, ou remove se não usas
+          PERFORMANCE_HOME: ${{ github.workspace }}   # <- chave para encontrar as libs
+          AUTHENTICATION: ${{ env.AUTHENTICATION }}   # remove se não usas
+        working-directory: ${{ github.workspace }}
         run: |
           echo "Running performance test ${{ inputs.TEST_ID }} on LAC ${{ inputs.LAC_ID }}"
           bash shell/run-test.sh \
@@ -59,17 +64,17 @@ jobs:
             "${{ github.repository }}" \
             "${{ inputs.LAC_ID }}" \
             "${{ inputs.TEST_ID }}" \
-            "${{ vars.PERFORMANCE_HOME }}" \
+            "${PERFORMANCE_HOME}" \
             "${{ github.actor }}" \
             "${{ github.ref_name }}" \
             "${{ secrets.VAULT_TOKEN }}" \
-            "${{ env.AUTHENTICATION }}"
+            "${AUTHENTICATION}"
 
-      # 5) Limpeza (sem barra invertida no fim)
+      # 5) Limpeza: passar SEM linhas em branco e SEM '\' no fim
       - name: Cleanup remote job
         if: always()
+        env:
+          PERFORMANCE_HOME: ${{ github.workspace }}
+        working-directory: ${{ github.workspace }}
         run: |
-          bash shell/cleanup-remote-job.sh \
-            "${{ inputs.LAC_ID }}" \
-            "${{ inputs.TEST_ID }}" \
-            "${{ secrets.VAULT_TOKEN }}"
+          bash shell/cleanup-remote-job.sh "${{ inputs.LAC_ID }}" "${{ inputs.TEST_ID }}" "${{ secrets.VAULT_TOKEN }}"
