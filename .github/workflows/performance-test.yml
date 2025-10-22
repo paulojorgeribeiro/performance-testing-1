@@ -23,8 +23,10 @@ jobs:
     runs-on: [self-hosted, linux, podman, perf]
     timeout-minutes: 600
     env:
-      # Modo DEV: saltar GitHub App
       AUTHENTICATION: none
+      SKIP_REGISTRY: "1"      # <— novo: indica aos scripts para ignorar o DPT Registry em DEV
+      DPT_REGISTRY_URL: ""    # <— limpa variáveis para não tentar curl
+      API_VERSION: ""
 
     steps:
       # (-1) Fix overlay: usar driver 'vfs' dentro do runner em contentor
@@ -189,3 +191,4 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           bash shell/cleanup-remote-job.sh "${{ inputs.LAC_ID }}" "${{ inputs.TEST_ID }}" "${VAULT_TOKEN}"
+
