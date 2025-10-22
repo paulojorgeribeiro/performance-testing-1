@@ -24,13 +24,14 @@ jobs:
         run: |
           echo "CONTAINERS_STORAGE_DRIVER=vfs" >> "$GITHUB_ENV"
 
-      # 0) Preparação: garantir que 'docker' chama Podman (não requer sudo)
-      - name: Make docker shim for Podman
+      # 0) "docker" → Podman remoto (API do host na 8666)
+      - name: Make docker shim for Podman (remote API)
         run: |
+          echo 'PODMAN_HOST=tcp://10.126.84.166:8666' >> "$GITHUB_ENV"
           mkdir -p "$HOME/bin"
           cat > "$HOME/bin/docker" <<'SH'
           #!/usr/bin/env sh
-          exec podman "$@"
+          exec podman --remote --url "$PODMAN_HOST" "$@"
           SH
           chmod +x "$HOME/bin/docker"
           echo "$HOME/bin" >> "$GITHUB_PATH"
@@ -39,12 +40,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2) Sanity – confirmar runtime e paths
-      - name: Sanity check (container runtime & paths)
+      # 2) Sanity – confirmar acesso ao Podman REMOTO e paths
+      - name: Sanity check (remote podman & paths)
         run: |
-          podman --version || true
+          podman --remote --url "$PODMAN_HOST" info
           docker --version || true
-          docker info || podman info
           echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
           ls -la "${GITHUB_WORKSPACE}/shell" || true
 
@@ -59,7 +59,7 @@ jobs:
       # 4) Executar o teste: usar o REPO como PERFORMANCE_HOME
       - name: Running test
         env:
-          PERFORMANCE_HOME: ${{ github.workspace }}   # <- chave para encontrar as libs
+          PERFORMANCE_HOME: ${{ github.workspace }}
           AUTHENTICATION: ${{ env.AUTHENTICATION }}   # remove se não usas
         working-directory: ${{ github.workspace }}
         run: |
@@ -75,7 +75,7 @@ jobs:
             "${{ secrets.VAULT_TOKEN }}" \
             "${AUTHENTICATION}"
 
-      # 5) Limpeza: passar SEM linhas em branco e SEM '\' no fim
+      # 5) Limpeza
       - name: Cleanup remote job
         if: always()
         env:
