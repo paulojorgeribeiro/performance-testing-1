@@ -5,44 +5,71 @@ on:
   workflow_dispatch:
     inputs:
       LAC_ID:
-        description: 'The LAC identifier'
+        description: "The LAC identifier"
         required: true
-        default: '<insert LAC.ID here>'
+        default: "LAC.0001"
       TEST_ID:
-        description: 'The Test identifier'
+        description: "The Test identifier"
         required: true
-        default: '<insert TEST.ID here>'
+        default: "TEST.0001"
 
 jobs:
   performance-test:
-    runs-on: self-hosted
-    timeout-minutes: 600  # Set timeout to 600 minutes (10 hour)
-    
+    runs-on: [self-hosted, linux, podman, perf]
+    timeout-minutes: 600
+
     steps:
-    - name: Running test  
-      run: |
-        echo "Running performance test ${{ github.event.inputs.TEST_ID }} on LAC ${{ github.event.inputs.LAC_ID }}"
-        
-        ${HOME}/run-test.sh \
-          "${{ secrets.GITHUB_TOKEN }}" \
-          "${{ github.repository }}" \
-          "${{ github.event.inputs.LAC_ID }}" \
-          "${{ github.event.inputs.TEST_ID }}" \
-          "${{ vars.PERFORMANCE_HOME }}" \
-          "${{ github.actor }}" \
-          "${{ github.ref_name }}" \
-          "${{ secrets.VAULT_TOKEN }}" \
-          "${{ env.AUTHENTICATION }}"
+      # 0) Sanity: confirmar runtime de contentores
+      - name: Sanity check (container runtime)
+        run: |
+          podman --version || true
+          docker --version || true
+          docker info || podman info
 
-        if [ $? -ne 0 ]; then
-          echo "Performance test failed"
-          exit 1
-        fi
+      # 1) Shim para que 'docker ...' use Podman (sem sudo)
+      - name: Make docker shim for Podman
+        run: |
+          mkdir -p "$HOME/bin"
+          cat > "$HOME/bin/docker" <<'SH'
+          #!/usr/bin/env sh
+          exec podman "$@"
+          SH
+          chmod +x "$HOME/bin/docker"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
 
-    - name: Cleanup remote job
-      if: ${{ always() }}
-      run: |
-        ${HOME}/cleanup-remote-job.sh \
-          "${{ github.event.inputs.LAC_ID }}" \
-          "${{ github.event.inputs.TEST_ID }}" \
-          "${{ secrets.VAULT_TOKEN }}"
+      # 2) Trazer o código para o workspace do GitHub Actions
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 3) Garantir permissões de execução nos scripts
+      - name: Make scripts executable
+        run: |
+          chmod +x shell/run-test.sh || true
+          chmod +x shell/run-test-performance-jmeter.sh || true
+          chmod +x shell/cleanup-remote-job.sh || true
+
+      # 4) Executar o teste a partir do repositório (NÃO do $HOME)
+      - name: Running test
+        env:
+          AUTHENTICATION: ${{ env.AUTHENTICATION }} # define em 'env:' global, variável de Actions, ou remove se não usas
+        run: |
+          echo "Running performance test ${{ inputs.TEST_ID }} on LAC ${{ inputs.LAC_ID }}"
+          bash shell/run-test.sh \
+            "${{ secrets.GITHUB_TOKEN }}" \
+            "${{ github.repository }}" \
+            "${{ inputs.LAC_ID }}" \
+            "${{ inputs.TEST_ID }}" \
+            "${{ vars.PERFORMANCE_HOME }}" \
+            "${{ github.actor }}" \
+            "${{ github.ref_name }}" \
+            "${{ secrets.VAULT_TOKEN }}" \
+            "${{ env.AUTHENTICATION }}"
+
+      # 5) Limpeza (sem barra invertida no fim)
+      - name: Cleanup remote job
+        if: always()
+        run: |
+          bash shell/cleanup-remote-job.sh \
+            "${{ inputs.LAC_ID }}" \
+            "${{ inputs.TEST_ID }}" \
+            "${{ secrets.VAULT_TOKEN }}"
