@@ -13,13 +13,17 @@ on:
         required: true
         default: "TEST.0001"
 
+# Variáveis globais para DEV
+env:
+  VAULT_ADDR: http://host.containers.internal:18200   # endpoint correto quando o job corre em contentor (Podman)
+  VAULT_TOKEN: root                                   # token DEV; em PROD usar secret
+
 jobs:
   performance-test:
     runs-on: [self-hosted, linux, podman, perf]
     timeout-minutes: 600
     env:
-      # Modo DEV: usar Vault local e saltar GitHub App
-      VAULT_URL: ${{ vars.VAULT_URL }}   # ex.: http://127.0.0.1:18200
+      # Modo DEV: saltar GitHub App
       AUTHENTICATION: none
 
     steps:
@@ -49,7 +53,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2) Sanity – confirmar acesso ao Podman REMOTO e paths
+      # 2) Sanity – confirmar acesso ao Podman remoto e paths
       - name: Sanity check (remote podman & paths)
         run: |
           podman --remote --url "$PODMAN_HOST" info || true
@@ -57,11 +61,9 @@ jobs:
           echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
           ls -la "${GITHUB_WORKSPACE}/shell" || true
 
-      # 2.5) Hotfix DEV: sobrescrever run-test.sh para usar VAULT_URL e saltar DPT Registry
-      - name: Patch run-test.sh for DEV (use VAULT_URL directly)
+      # 2.5) Hotfix DEV: substituir run-test.sh para usar VAULT_ADDR (fallback VAULT_URL) e saltar DPT Registry
+      - name: Patch run-test.sh for DEV (use VAULT_ADDR/URL)
         working-directory: ${{ github.workspace }}
-        env:
-          VAULT_URL: ${{ vars.VAULT_URL }}
         run: |
           mv shell/run-test.sh shell/run-test.orig.sh
           cat > shell/run-test.sh <<'SH'
@@ -81,32 +83,33 @@ jobs:
           # shellcheck disable=SC1090
           source "${LIB_PATH}"
 
-          # === DEV: usar VAULT_URL do ambiente e saltar DPT Registry ===
-          if [[ -z "${VAULT_URL:-}" ]]; then
-            echo "[ERROR] VAULT_URL not set. Define vars.VAULT_URL no GitHub (ex.: http://127.0.0.1:18200)."
+          # === DEV: preferir VAULT_ADDR; fallback para VAULT_URL ===
+          VAULT_ENDPOINT="${VAULT_ADDR:-${VAULT_URL:-}}"
+          if [[ -z "${VAULT_ENDPOINT}" ]]; then
+            echo "[ERROR] VAULT_ADDR/VAULT_URL não definido."
             exit 1
           fi
-          echo "[INFO] Using VAULT_URL from environment: ${VAULT_URL}"
+          echo "[INFO] Using Vault endpoint: ${VAULT_ENDPOINT}"
 
           # Buscar PTP_API_KEY ao Vault
           echo "[INFO] Fetching PTP_API_KEY from Vault..."
           PTP_API_KEY=$(curl -sS \
             --header "X-Vault-Token: ${VAULT_TOKEN}" \
-            --request GET "${VAULT_URL}/v1/devplatforms/data/performance-platform/application" \
+            --request GET "${VAULT_ENDPOINT}/v1/devplatforms/data/performance-platform/application" \
             | jq -r '.data.data.ptp_api_key // empty')
           if [[ -z "${PTP_API_KEY}" ]]; then echo "[ERROR] Failed to retrieve API_KEY from Vault."; exit 1; fi
           export PTP_API_KEY
 
           # Saltar GitHub App em DEV
           if [[ "${AUTHENTICATION}" != "none" ]]; then
-            echo "[WARN] AUTHENTICATION!=none, mas em DEV recomenda-se none; a continuar assim mesmo."
+            echo "[WARN] AUTHENTICATION!=none; em DEV recomenda-se none; a continuar assim mesmo."
           else
             echo "[INFO] Skipping GitHub App authentication in DEV (AUTHENTICATION=none)."
           fi
 
           # Renovar token do Vault (best-effort)
           curl -sS --request POST -H "X-Vault-Token: ${VAULT_TOKEN}" \
-            "${VAULT_URL}/v1/auth/token/renew-self" >/dev/null || true
+            "${VAULT_ENDPOINT}/v1/auth/token/renew-self" >/dev/null || true
           echo "[INFO] Vault token renew attempted."
 
           # Obter test-definition.json
@@ -150,10 +153,19 @@ jobs:
           chmod +x shell/run-test-performance-jmeter.sh || true
           chmod +x shell/cleanup-remote-job.sh || true
 
+      # 3.5) Diagnóstico — Health do Vault (usar a mesma lógica do script)
+      - name: Diag — Health do Vault
+        run: |
+          set -euo pipefail
+          VAULT_ENDPOINT="${VAULT_ADDR:-${VAULT_URL:-}}"
+          echo "[diag] VAULT_ENDPOINT=$VAULT_ENDPOINT"
+          echo "[diag] Testar saúde do Vault..."
+          curl -sS "$VAULT_ENDPOINT/v1/sys/health" || (echo "[diag] Falha a aceder ao Vault" && exit 1)
+
       # 4) Executar o teste: usar o REPO como PERFORMANCE_HOME
       - name: Running test
         env:
-          PERFORMANCE_HOME: ${{ github.workspace }}   # <- chave para encontrar as libs
+          PERFORMANCE_HOME: ${{ github.workspace }}   # chave para encontrar as libs
           AUTHENTICATION: ${{ env.AUTHENTICATION }}   # (já definido no job)
         working-directory: ${{ github.workspace }}
         run: |
@@ -166,14 +178,14 @@ jobs:
             "${PERFORMANCE_HOME}" \
             "${{ github.actor }}" \
             "${{ github.ref_name }}" \
-            "${{ secrets.VAULT_TOKEN }}" \
+            "${VAULT_TOKEN}" \
             "${AUTHENTICATION}"
 
-      # 5) Limpeza
+      # 5) Limpeza (corre sempre)
       - name: Cleanup remote job
         if: always()
         env:
           PERFORMANCE_HOME: ${{ github.workspace }}
         working-directory: ${{ github.workspace }}
         run: |
-          bash shell/cleanup-remote-job.sh "${{ inputs.LAC_ID }}" "${{ inputs.TEST_ID }}" "${{ secrets.VAULT_TOKEN }}"
+          bash shell/cleanup-remote-job.sh "${{ inputs.LAC_ID }}" "${{ inputs.TEST_ID }}" "${VAULT_TOKEN}"
