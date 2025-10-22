@@ -80,16 +80,18 @@ if [[ -n "${DPT_REGISTRY_URL:-}" && -n "${API_VERSION:-}" ]]; then
   fi
 fi
 
-# -------- Run ID file --------
+# -------- Run ID file (tolerante em DEV) --------
 RUN_FILE="/tmp/.${LAC_ID}-${TEST_ID}.run_id"
 if [[ ! -f "$RUN_FILE" ]]; then
-  echo "[ERROR] Run ID file $RUN_FILE does not exist."
-  exit 1
+  echo "[WARN] Run ID file $RUN_FILE does not exist. Skipping remote cleanup (DEV)."
+  echo "[WARN] (Dica) Garante que o script de execução guarda o Run ID neste path."
+  exit 0
 fi
+
 RUN_ID="$(<"$RUN_FILE")"
 if [[ -z "$RUN_ID" ]]; then
-  echo "[ERROR] Run ID not found in file $RUN_FILE"
-  exit 1
+  echo "[WARN] Run ID empty in $RUN_FILE. Skipping remote cleanup (DEV)."
+  exit 0
 fi
 
 # -------- Execution data --------
