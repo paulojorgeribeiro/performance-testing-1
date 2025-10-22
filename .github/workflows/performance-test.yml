@@ -19,6 +19,11 @@ jobs:
     timeout-minutes: 600
 
     steps:
+      # (-1) Fix overlay: usar driver 'vfs' dentro do runner em contentor
+      - name: Force Podman to use vfs (container runner fix)
+        run: |
+          echo "CONTAINERS_STORAGE_DRIVER=vfs" >> "$GITHUB_ENV"
+
       # 0) Preparação: garantir que 'docker' chama Podman (não requer sudo)
       - name: Make docker shim for Podman
         run: |
