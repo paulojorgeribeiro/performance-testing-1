@@ -17,6 +17,10 @@ jobs:
   performance-test:
     runs-on: [self-hosted, linux, podman, perf]
     timeout-minutes: 600
+    env:
+      # Modo DEV: usar Vault local e saltar GitHub App
+      VAULT_URL: ${{ vars.VAULT_URL }}   # ex.: http://127.0.0.1:18200
+      AUTHENTICATION: none
 
     steps:
       # (-1) Fix overlay: usar driver 'vfs' dentro do runner em contentor
@@ -24,15 +28,14 @@ jobs:
         run: |
           echo "CONTAINERS_STORAGE_DRIVER=vfs" >> "$GITHUB_ENV"
 
-      # 0) "docker" → Podman remoto (API do host na 8666)
+      # 0) "docker" → Podman remoto (API do host via 8666, com fallback)
       - name: Make docker shim for Podman (remote API)
         run: |
-          # Tenta o nome canónico; se falhar, usa o IP especial 10.0.2.2
           echo 'PODMAN_HOST=tcp://host.containers.internal:8666' >> "$GITHUB_ENV"
           mkdir -p "$HOME/bin"
           cat > "$HOME/bin/docker" <<'SH'
           #!/usr/bin/env sh
-          # fallback automático se o DNS interno não existir
+          # tenta host.containers.internal; se falhar, usa 10.0.2.2 (slirp4netns)
           if podman --remote --url "$PODMAN_HOST" info >/dev/null 2>&1; then
             exec podman --remote --url "$PODMAN_HOST" "$@"
           else
@@ -49,10 +52,95 @@ jobs:
       # 2) Sanity – confirmar acesso ao Podman REMOTO e paths
       - name: Sanity check (remote podman & paths)
         run: |
-          podman --remote --url "$PODMAN_HOST" info
+          podman --remote --url "$PODMAN_HOST" info || true
           docker --version || true
           echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
           ls -la "${GITHUB_WORKSPACE}/shell" || true
+
+      # 2.5) Hotfix DEV: sobrescrever run-test.sh para usar VAULT_URL e saltar DPT Registry
+      - name: Patch run-test.sh for DEV (use VAULT_URL directly)
+        working-directory: ${{ github.workspace }}
+        env:
+          VAULT_URL: ${{ vars.VAULT_URL }}
+        run: |
+          mv shell/run-test.sh shell/run-test.orig.sh
+          cat > shell/run-test.sh <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          echo "[INFO] Starting test run..."
+          echo "[INFO] Defining runtime variables..."
+
+          GITHUB_TOKEN="${1}"; REPO="${2}"; LAC_ID="${3}"; TEST_ID="${4}"; TEST_HOME="${5}";
+          USER_NAME="${6}"; GITHUB_REF_NAME="${7}"; VAULT_TOKEN="${8}";
+          AUTHENTICATION="${9:-none}"; SCRIPT_VERSION="${10:-}"
+
+          SHELL_DIR="${TEST_HOME}/shell"
+          LIB_PATH="${SHELL_DIR}/run-test-lib.sh"
+          if [[ ! -f "${LIB_PATH}" ]]; then echo "[ERROR] Failed to load libs"; exit 1; fi
+          # shellcheck disable=SC1090
+          source "${LIB_PATH}"
+
+          # === DEV: usar VAULT_URL do ambiente e saltar DPT Registry ===
+          if [[ -z "${VAULT_URL:-}" ]]; then
+            echo "[ERROR] VAULT_URL not set. Define vars.VAULT_URL no GitHub (ex.: http://127.0.0.1:18200)."
+            exit 1
+          fi
+          echo "[INFO] Using VAULT_URL from environment: ${VAULT_URL}"
+
+          # Buscar PTP_API_KEY ao Vault
+          echo "[INFO] Fetching PTP_API_KEY from Vault..."
+          PTP_API_KEY=$(curl -sS \
+            --header "X-Vault-Token: ${VAULT_TOKEN}" \
+            --request GET "${VAULT_URL}/v1/devplatforms/data/performance-platform/application" \
+            | jq -r '.data.data.ptp_api_key // empty')
+          if [[ -z "${PTP_API_KEY}" ]]; then echo "[ERROR] Failed to retrieve API_KEY from Vault."; exit 1; fi
+          export PTP_API_KEY
+
+          # Saltar GitHub App em DEV
+          if [[ "${AUTHENTICATION}" != "none" ]]; then
+            echo "[WARN] AUTHENTICATION!=none, mas em DEV recomenda-se none; a continuar assim mesmo."
+          else
+            echo "[INFO] Skipping GitHub App authentication in DEV (AUTHENTICATION=none)."
+          fi
+
+          # Renovar token do Vault (best-effort)
+          curl -sS --request POST -H "X-Vault-Token: ${VAULT_TOKEN}" \
+            "${VAULT_URL}/v1/auth/token/renew-self" >/dev/null || true
+          echo "[INFO] Vault token renew attempted."
+
+          # Obter test-definition.json
+          echo "[INFO] Fetching test-definition.json..."
+          curl -sS -H "Authorization: token ${GITHUB_TOKEN}" \
+               -H "Accept: application/vnd.github.v3.raw" \
+               -o test-definition.json \
+               "https://api.github.com/repos/${REPO}/contents/${TEST_HOME}/${LAC_ID}/${TEST_ID}/test-definition.json?ref=${GITHUB_REF_NAME}"
+          if [[ ! -s test-definition.json ]] ; then echo "[ERROR] test-definition.json not found"; exit 1; fi
+
+          # Executar por tipo
+          for TYPE in $(jq -r '.test | keys[]' test-definition.json); do
+            case "${TYPE}" in
+              performance)
+                bash "${SHELL_DIR}/cleanup-remote-job.sh" "${LAC_ID}" "${TEST_ID}" "${VAULT_TOKEN}" || true
+                bash "${SHELL_DIR}/run-test-performance.sh" \
+                  "${GITHUB_TOKEN}" "${REPO}" "${LAC_ID}" "${TEST_ID}" "${TEST_HOME}" \
+                  "${USER_NAME}" "${GITHUB_REF_NAME}" "${VAULT_TOKEN}" "" "${PTP_API_KEY}" \
+                  "${AUTHENTICATION}" "${SCRIPT_VERSION}" || handle_error "[ERROR] Test run failed!"
+                ;;
+              resilience)
+                bash "${SHELL_DIR}/run-test-resilience.sh" \
+                  "${GITHUB_TOKEN}" "${REPO}" "${LAC_ID}" "${TEST_ID}" "${TEST_HOME}" \
+                  "${USER_NAME}" "${GITHUB_REF_NAME}" "${VAULT_TOKEN}" "" "${PTP_API_KEY}" \
+                  || handle_error "[ERROR] Test run failed!"
+                ;;
+              *)
+                echo "[ERROR] Unsupported test type: ${TYPE}"; exit 1;;
+            esac
+          done
+
+          echo "[INFO] Test run completed."
+          SH
+          chmod +x shell/run-test.sh
 
       # 3) Permissões de execução
       - name: Make scripts executable
@@ -65,8 +153,8 @@ jobs:
       # 4) Executar o teste: usar o REPO como PERFORMANCE_HOME
       - name: Running test
         env:
-          PERFORMANCE_HOME: ${{ github.workspace }}
-          AUTHENTICATION: ${{ env.AUTHENTICATION }}   # remove se não usas
+          PERFORMANCE_HOME: ${{ github.workspace }}   # <- chave para encontrar as libs
+          AUTHENTICATION: ${{ env.AUTHENTICATION }}   # (já definido no job)
         working-directory: ${{ github.workspace }}
         run: |
           echo "Running performance test ${{ inputs.TEST_ID }} on LAC ${{ inputs.LAC_ID }}"
@@ -89,4 +177,3 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           bash shell/cleanup-remote-job.sh "${{ inputs.LAC_ID }}" "${{ inputs.TEST_ID }}" "${{ secrets.VAULT_TOKEN }}"
-
