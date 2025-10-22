@@ -1,8 +1,8 @@
 name: Main Schedule Workflow v2
 
 on:
-  schedule:
-    - cron: '0,30 * * * *'  # Runs every 30 minutes
+  #schedule:
+    #- cron: '0,30 * * * *'  # Runs every 30 minutes
   workflow_dispatch:  # Allows manual triggering
 
 env:
@@ -30,3 +30,4 @@ jobs:
           echo "Schedule validation failed"
           exit 1
         fi
+
