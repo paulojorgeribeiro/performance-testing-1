@@ -231,6 +231,49 @@ jobs:
             "${VAULT_TOKEN}" \
             "${AUTHENTICATION}"
 
+      # 4.1) Gerar summary.json (usa CSV em results/raw se existir; senão usa envs)
+      - name: Build results summary
+        run: |
+          # Caso o teu script já calcule métricas, exporta-as aqui (opcional):
+          # export THROUGHPUT_RPS=150
+          # export P95_MS=420
+          # export AVG_MS=210
+          # export ERROR_PCT=0.5
+          # export DURATION_S=300
+          # export REQUESTS_TOTAL=45000
+          bash shell/report-summary.sh "${LAC_ID}" "${TEST_ID}" "results"
+          test -s results/summary.json
+
+    # 4.2) Publicar artefactos (summary + brutos)
+      - name: Upload results artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-results-${{ env.LAC_ID }}-${{ env.TEST_ID }}-${{ github.run_id }}
+          path: |
+            results/summary.json
+            results/raw/**
+          if-no-files-found: warn
+
+    # 4.3) Sumário imediato no GitHub Actions (Markdown)
+      - name: Write run summary
+        run: |
+          # jq é usado noutros passos; se faltar, instala: sudo apt-get update && sudo apt-get install -y jq
+          THR=$(jq -r '.metrics.throughput_rps' results/summary.json)
+          P95=$(jq -r '.metrics.p95_latency_ms' results/summary.json)
+          ERR=$(jq -r '.metrics.error_rate_pct' results/summary.json)
+          DUR=$(jq -r '.metrics.duration_s' results/summary.json)
+          REQ=$(jq -r '.metrics.requests_total' results/summary.json)
+          echo "## Resultados — ${LAC_ID} / ${TEST_ID}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Métrica | Valor |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---:|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Throughput (RPS) | $THR |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| P95 Latência (ms) | $P95 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Taxa de Erro (%) | $ERR |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Duração (s) | $DUR |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pedidos totais | $REQ |" >> "$GITHUB_STEP_SUMMARY"
+
+
       # 5) Cleanup (corre sempre; tolerante em DEV)
       - name: Cleanup remote job
         if: always()
@@ -239,3 +282,4 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           bash shell/cleanup-remote-job.sh "${LAC_ID}" "${TEST_ID}" "${VAULT_TOKEN}"
+
