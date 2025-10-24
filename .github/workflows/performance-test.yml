@@ -270,11 +270,11 @@ jobs:
       - name: Write run summary
         run: |
           set -euo pipefail
-          THR=$(jq -r '.metrics.throughput_rps' results/summary.json)
-          P95=$(jq -r '.metrics.p95_latency_ms' results/summary.json)
-          ERR=$(jq -r '.metrics.error_rate_pct' results/summary.json)
-          DUR=$(jq -r '.metrics.duration_s' results/summary.json)
-          REQ=$(jq -r '.metrics.requests_total' results/summary.json)
+          THR=$(jq -r '.metrics.throughput_rps' results/summary.json)   # RPS (Requests Per Second — pedidos por segundo)
+          P95=$(jq -r '.metrics.p95_latency_ms' results/summary.json)   # P95 (Percentil 95) de latência em ms
+          ERR=$(jq -r '.metrics.error_rate_pct' results/summary.json)   # Taxa de erro (%)
+          DUR=$(jq -r '.metrics.duration_s' results/summary.json)       # Duração (s)
+          REQ=$(jq -r '.metrics.requests_total' results/summary.json)   # Total de pedidos
           {
             echo "## Resultados — ${LAC_ID} / ${TEST_ID}"
             echo
@@ -299,15 +299,30 @@ jobs:
           test -s results/summary.json
           command -v jq >/dev/null || { echo "jq em falta"; exit 1; }
 
-          CURL="curl -sS --http1.1 --retry 3 --retry-all-errors --fail-with-body"
+          # Construção dinâmica de flags do curl consoante a versão disponível
+          CURL_BIN="curl"
+          CURL_FLAGS=( -sS --http1.1 --retry 3 --retry-delay 2 )
+          if "$CURL_BIN" --help 2>/dev/null | grep -q -- '--retry-all-errors'; then
+            CURL_FLAGS+=( --retry-all-errors )
+          fi
+          if "$CURL_BIN" --help 2>/dev/null | grep -q -- '--retry-connrefused'; then
+            CURL_FLAGS+=( --retry-connrefused )
+          fi
+          if "$CURL_BIN" --help 2>/dev/null | grep -q -- '--fail-with-body'; then
+            CURL_FLAGS+=( --fail-with-body )
+          else
+            CURL_FLAGS+=( --fail )
+          fi
+          CURL() { "$CURL_BIN" "${CURL_FLAGS[@]}" "$@"; }
+
           AUTH="$(printf '%s:%s' "$JIRA_EMAIL" "$JIRA_API_TOKEN" | base64)"
 
-          THR=$(jq -r '.metrics.throughput_rps' results/summary.json)
-          P95=$(jq -r '.metrics.p95_latency_ms' results/summary.json)
-          ERR=$(jq -r '.metrics.error_rate_pct' results/summary.json)
-          DUR=$(jq -r '.metrics.duration_s' results/summary.json)
-          REQ=$(jq -r '.metrics.requests_total' results/summary.json)
-          TS=$(jq -r '.timestamp_utc' results/summary.json)
+          THR=$(jq -r '.metrics.throughput_rps' results/summary.json)   # RPS (Requests Per Second — pedidos por segundo)
+          P95=$(jq -r '.metrics.p95_latency_ms' results/summary.json)   # P95 (Percentil 95) de latência em ms
+          ERR=$(jq -r '.metrics.error_rate_pct' results/summary.json)   # Taxa de erro (%)
+          DUR=$(jq -r '.metrics.duration_s' results/summary.json)       # Duração (s)
+          REQ=$(jq -r '.metrics.requests_total' results/summary.json)   # Total de pedidos
+          TS=$(jq -r '.timestamp_utc' results/summary.json)             # UTC (Coordinated Universal Time — Tempo Universal Coordenado)
 
           SUMMARY="Perf: ${LAC_ID}/${TEST_ID} @ ${LABEL_ENV:-dev} (run ${{ github.run_id }})"
 
@@ -334,7 +349,7 @@ jobs:
           PAYLOAD=$(jq -n --arg p "$JIRA_PROJECT_KEY" --arg s "$SUMMARY" --arg d "$DESC" \
             '{fields:{project:{key:$p},summary:$s,description:$d,issuetype:{name:"Task"}}}')
 
-          CREATE_RES=$($CURL -X POST "$JIRA_BASE_URL/rest/api/2/issue" \
+          CREATE_RES=$(CURL -X POST "$JIRA_BASE_URL/rest/api/2/issue" \
             -H "Authorization: Basic $AUTH" \
             -H "Accept: application/json" \
             -H "Content-Type: application/json" \
@@ -348,13 +363,13 @@ jobs:
 
           RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           COMMENT=$(jq -n --arg c "**Run:** $RUN_URL" '{body:$c}')
-          $CURL -X POST "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE_KEY/comment" \
+          CURL -X POST "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE_KEY/comment" \
             -H "Authorization: Basic $AUTH" \
             -H "Accept: application/json" \
             -H "Content-Type: application/json" \
             -d "$COMMENT" >/dev/null
 
-          $CURL -X POST "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE_KEY/attachments" \
+          CURL -X POST "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE_KEY/attachments" \
             -H "Authorization: Basic $AUTH" \
             -H "X-Atlassian-Token: no-check" \
             -H "Accept: application/json" \
