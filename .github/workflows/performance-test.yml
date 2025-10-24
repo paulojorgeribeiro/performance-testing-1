@@ -1,5 +1,5 @@
 name: Performance Test
-description: Run performance tests on the specified LAC and TEST ID.
+description: Run performance tests from a config file and publish results.
 
 on:
   workflow_dispatch:
@@ -8,24 +8,18 @@ on:
         description: "Execution mode (dev|prod)"
         required: true
         default: "dev"
-      LAC_ID:
-        description: "The LAC identifier"
+      CONFIG_PATH:
+        description: "Caminho do YAML do teste (ex.: configs/TEST.0001.yml)"
         required: true
-        default: "LAC.0001"
-      TEST_ID:
-        description: "The Test identifier"
-        required: true
-        default: "TEST.0001"
+        default: "configs/TEST.0001.yml"
 
 jobs:
   performance-test:
     runs-on: [self-hosted, linux, podman, perf]
     timeout-minutes: 600
-    # Variáveis base; serão refinadas no step "Set environment mode"
     env:
       MODE: ${{ inputs.ENVIRONMENT }}   # dev|prod
       AUTHENTICATION: none              # em prod pode mudar para "app"
-      # Nota: VAULT_ADDR/VAULT_TOKEN serão definidos dinamicamente
 
     steps:
       # (-1) Fix overlay: usar driver 'vfs' dentro do runner em contentor
@@ -53,7 +47,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 1.1) Set environment mode (DEV vs PROD)
+      # 1.1) Set environment mode (DEV/PROD)
       - name: Set environment mode (DEV/PROD)
         run: |
           echo "[INFO] Selected mode: ${MODE}"
@@ -65,8 +59,7 @@ jobs:
             echo "DPT_REGISTRY_URL=" >> "$GITHUB_ENV"
             echo "API_VERSION=" >> "$GITHUB_ENV"
           else
-            # ⚠️ Em PROD (Production): define estes secrets no repositório/organização
-            # Settings → Secrets and variables → Actions → New repository secret
+            # ⚠️ Em PROD: defina estes secrets/vars no GitHub
             echo "VAULT_ADDR=${{ secrets.VAULT_PROD_ADDR }}" >> "$GITHUB_ENV"
             echo "VAULT_TOKEN=${{ secrets.VAULT_PROD_TOKEN }}" >> "$GITHUB_ENV"
             echo "AUTHENTICATION=app" >> "$GITHUB_ENV"
@@ -74,6 +67,29 @@ jobs:
             echo "DPT_REGISTRY_URL=${{ secrets.DPT_REGISTRY_URL }}" >> "$GITHUB_ENV"
             echo "API_VERSION=${{ vars.DPT_API_VERSION }}" >> "$GITHUB_ENV"
           fi
+
+      # 1.2) Instalar yq (parser de YAML)
+      - name: Install yq (YAML parser)
+        run: |
+          curl -sSL https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o /usr/local/bin/yq
+          chmod +x /usr/local/bin/yq
+          yq --version
+
+      # 1.3) Carregar a config YAML e exportar variáveis
+      - name: Load test config
+        run: |
+          set -euo pipefail
+          test -f "${{ inputs.CONFIG_PATH }}" || { echo "Config não encontrada: ${{ inputs.CONFIG_PATH }}"; exit 1; }
+          echo "LAC_ID=$(yq -r '.lac_id' '${{ inputs.CONFIG_PATH }}')" >> "$GITHUB_ENV"
+          echo "TEST_ID=$(yq -r '.test_id' '${{ inputs.CONFIG_PATH }}')" >> "$GITHUB_ENV"
+          echo "BASE_URL=$(yq -r '.target.base_url' '${{ inputs.CONFIG_PATH }}')" >> "$GITHUB_ENV"
+          echo "DURATION_S=$(yq -r '.load.duration_s' '${{ inputs.CONFIG_PATH }}')" >> "$GITHUB_ENV"
+          echo "RPS=$(yq -r '.load.rps' '${{ inputs.CONFIG_PATH }}')" >> "$GITHUB_ENV"
+          echo "CONCURRENCY=$(yq -r '.load.concurrency' '${{ inputs.CONFIG_PATH }}')" >> "$GITHUB_ENV"
+          echo "LABEL_ENV=$(yq -r '.labels.environment' '${{ inputs.CONFIG_PATH }}')" >> "$GITHUB_ENV"
+          echo "LABEL_SYS=$(yq -r '.labels.system' '${{ inputs.CONFIG_PATH }}')" >> "$GITHUB_ENV"
+          echo "LABEL_NOTES=$(yq -r '.labels.notes' '${{ inputs.CONFIG_PATH }}')" >> "$GITHUB_ENV"
+          echo "[cfg] Carregado ${LAC_ID}/${TEST_ID} @ ${BASE_URL}"
 
       # 2) Sanity – confirmar Podman remoto e paths
       - name: Sanity check (remote podman & paths)
@@ -99,7 +115,7 @@ jobs:
                -d '{"data":{"ptp_api_key":"dummy-ptp-key-123"}}' >/dev/null
           echo "[seed] OK"
 
-      # 2.6) Hotfix DEV/PROD: run-test.sh com VAULT_ADDR/VAULT_URL e fallback
+      # 2.6) Hotfix: patch ao run-test.sh (preferir VAULT_ADDR; fallback VAULT_URL)
       - name: Patch run-test.sh (prefer VAULT_ADDR; fallback VAULT_URL)
         working-directory: ${{ github.workspace }}
         run: |
@@ -185,7 +201,7 @@ jobs:
           chmod +x shell/run-test-performance-jmeter.sh || true
           chmod +x shell/cleanup-remote-job.sh || true
 
-      # 3.5) Diagnóstico — Health do Vault (mesma lógica do script)
+      # 3.5) Diagnóstico — Health do Vault
       - name: Diag — Health do Vault
         run: |
           set -euo pipefail
@@ -194,30 +210,32 @@ jobs:
           echo "[diag] Testar saúde do Vault..."
           curl -sS "$VAULT_ENDPOINT/v1/sys/health" || (echo "[diag] Falha a aceder ao Vault" && exit 1)
 
-      # 4) Running test
+      # 4) Running test (usa LAC_ID/TEST_ID da config YAML)
       - name: Running test
         env:
           PERFORMANCE_HOME: ${{ github.workspace }}
           AUTHENTICATION: ${{ env.AUTHENTICATION }}
         working-directory: ${{ github.workspace }}
         run: |
-          echo "Running performance test ${{ inputs.TEST_ID }} on LAC ${{ inputs.LAC_ID }}"
+          echo "Running performance test ${TEST_ID} on LAC ${LAC_ID}"
+          # disponibilizar config aos scripts
+          export BASE_URL DURATION_S RPS CONCURRENCY LABEL_ENV LABEL_SYS LABEL_NOTES
           bash shell/run-test.sh \
             "${{ secrets.GITHUB_TOKEN }}" \
             "${{ github.repository }}" \
-            "${{ inputs.LAC_ID }}" \
-            "${{ inputs.TEST_ID }}" \
+            "${LAC_ID}" \
+            "${TEST_ID}" \
             "${PERFORMANCE_HOME}" \
             "${{ github.actor }}" \
             "${{ github.ref_name }}" \
             "${VAULT_TOKEN}" \
             "${AUTHENTICATION}"
 
-      # 5) Cleanup (corre sempre; tolerante a DEV)
+      # 5) Cleanup (corre sempre; tolerante em DEV)
       - name: Cleanup remote job
         if: always()
         env:
           PERFORMANCE_HOME: ${{ github.workspace }}
         working-directory: ${{ github.workspace }}
         run: |
-          bash shell/cleanup-remote-job.sh "${{ inputs.LAC_ID }}" "${{ inputs.TEST_ID }}" "${VAULT_TOKEN}"
+          bash shell/cleanup-remote-job.sh "${LAC_ID}" "${TEST_ID}" "${VAULT_TOKEN}"
