@@ -15,7 +15,7 @@ on:
 
 jobs:
   performance-test:
-    runs-on: [self-hosted, linux, podman, perf]
+    runs-on: self-hosted #[self-hosted, linux, podman, perf]
     timeout-minutes: 600
     env:
       MODE: ${{ inputs.ENVIRONMENT }}   # dev|prod
@@ -282,4 +282,5 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           bash shell/cleanup-remote-job.sh "${LAC_ID}" "${TEST_ID}" "${VAULT_TOKEN}"
+
 
