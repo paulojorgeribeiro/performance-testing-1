@@ -1,0 +1,21 @@
+{
+  "lac_id": "LAC.0001",
+  "test_id": "TEST.0001~",
+  "timestamp_utc": "2025-10-24T09:59:25Z",
+  "tool": "jmeter",
+  "version": "1.0",
+  "metrics": {
+    "throughput_rps": 150,
+    "avg_latency_ms": 210,
+    "p95_latency_ms": 420,
+    "error_rate_pct": 0.5,
+    "duration_s": 300,
+    "requests_total": 45000
+  },
+  "labels": {
+    "environment": "dev",
+    "system": "payments",
+    "notes": "baseline"
+  },
+  "base_url": "https://api.dev.example"
+}
