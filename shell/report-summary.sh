@@ -66,4 +66,3 @@ cat > "${SUMMARY}" <<JSON
 JSON
 
 echo "[OK] summary: ${SUMMARY}"
-SH
