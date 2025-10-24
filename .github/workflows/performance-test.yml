@@ -287,6 +287,93 @@ jobs:
           echo "| Duração (s) | $DUR |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Pedidos totais | $REQ |" >> "$GITHUB_STEP_SUMMARY"
 
+      # 4.4) Publicar no JIRA: criar issue, comentar métricas e anexar summary.json
+      - name: Publish to JIRA
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
+        run: |
+          set -euo pipefail
+
+      # Pré-requisitos
+          test -s results/summary.json
+          command -v jq >/dev/null || { echo "jq em falta"; exit 1; }
+
+      # Auth Jira Cloud (Basic Auth)
+          AUTH="$(printf '%s:%s' "$JIRA_EMAIL" "$JIRA_API_TOKEN" | base64)"
+
+      # Extrair métricas
+          THR=$(jq -r '.metrics.throughput_rps' results/summary.json)
+          P95=$(jq -r '.metrics.p95_latency_ms' results/summary.json)
+          ERR=$(jq -r '.metrics.error_rate_pct' results/summary.json)
+          DUR=$(jq -r '.metrics.duration_s' results/summary.json)
+          REQ=$(jq -r '.metrics.requests_total' results/summary.json)
+          TS=$(jq -r '.timestamp_utc' results/summary.json)
+
+          SUMMARY="Perf: ${LAC_ID}/${TEST_ID} @ ${LABEL_ENV:-dev} (run ${{ github.run_id }})"
+
+     # Descrição Markdown
+          read -r -d '' DESC <<'MD' || true
+          **Performance Test**
+          - LAC: `${LAC_ID}`
+          - TEST: `${TEST_ID}`
+          - Environment: `${LABEL_ENV:-}`
+          - System: `${LABEL_SYS:-}`
+          - Notes: `${LABEL_NOTES:-}`
+          - Timestamp (UTC): `${TS}`
+          - Base URL: `${BASE_URL:-}`
+
+          **Metrics**
+          | Métrica | Valor |
+          |---|---:|
+          | Throughput (RPS) | ${THR} |
+          | P95 Latência (ms) | ${P95} |
+          | Taxa de Erro (%) | ${ERR} |
+          | Duração (s) | ${DUR} |
+          | Pedidos totais | ${REQ} |
+          MD
+
+     # 1) Criar Issue
+          CREATE_PAYLOAD=$(jq -n --arg p "$JIRA_PROJECT_KEY" --arg s "$SUMMARY" --arg d "$DESC" '{
+            fields: {
+              project: { key: $p },
+              summary: $s,
+              description: $d,
+              issuetype: { name: "Task" }
+            }
+          }')
+
+          CREATE_RES=$(curl -sS -X POST "$JIRA_BASE_URL/rest/api/2/issue" \
+            -H "Authorization: Basic $AUTH" \
+            -H "Content-Type: application/json" \
+            -d "$CREATE_PAYLOAD")
+
+          ISSUE_KEY=$(echo "$CREATE_RES" | jq -r '.key // empty')
+          if [ -z "$ISSUE_KEY" ] || [ "$ISSUE_KEY" = "null" ]; then
+            echo "[JIRA] Falhou a criação: $CREATE_RES"
+            exit 1
+          fi
+          echo "[JIRA] Issue criada: $ISSUE_KEY"
+
+          # 2) Comentar com link da run
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          COMMENT=$(jq -n --arg c "**Run:** $RUN_URL" '{body: $c}')
+          curl -sS -X POST "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE_KEY/comment" \
+            -H "Authorization: Basic $AUTH" \
+            -H "Content-Type: application/json" \
+            -d "$COMMENT" >/dev/null
+
+          # 3) Anexar summary.json
+          curl -sS -X POST "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE_KEY/attachments" \
+            -H "Authorization: Basic $AUTH" \
+            -H "X-Atlassian-Token: no-check" \
+            -F "file=@results/summary.json" >/dev/null
+
+          echo "[JIRA] Comentário e anexo enviados."
+
+      
       # 5) Cleanup (corre sempre; tolerante em DEV)
       - name: Cleanup remote job
         if: always()
@@ -295,3 +382,4 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           bash shell/cleanup-remote-job.sh "${LAC_ID}" "${TEST_ID}" "${VAULT_TOKEN}"
+
