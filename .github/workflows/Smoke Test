@@ -1,0 +1,10 @@
+name: Smoke Test
+on:
+  workflow_dispatch:
+
+jobs:
+  ok:
+    runs-on: self-hosted
+    steps:
+      - name: Echo
+        run: echo "Actions está operacional."
