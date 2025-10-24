@@ -287,7 +287,7 @@ jobs:
             echo "| Pedidos totais | $REQ |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # 4.4) Publicar no JIRA (força HTTP/1.1; lida com Issue Type/erros 4xx)
+      # 4.4) Publicar no JIRA (negociação automática HTTP/2↔HTTP/1.1)
       - name: Publish to JIRA
         env:
           JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
@@ -299,19 +299,41 @@ jobs:
           test -s results/summary.json
           command -v jq >/dev/null || { echo "jq em falta"; exit 1; }
 
-          # ===== Curl helpers (detetam flags e permitem capturar corpo em 4xx/5xx) =====
+          # ===== Curl helpers: flags dinâmicas e tentativa dupla (AUTO, depois H1 se necessário) =====
           CURL_BIN="curl"
-          BASE_FLAGS=( -sS --http1.1 --retry 3 --retry-delay 2 )
-          if "$CURL_BIN" --help 2>/dev/null | grep -q -- '--retry-all-errors'; then BASE_FLAGS+=( --retry-all-errors ); fi
-          if "$CURL_BIN" --help 2>/dev/null | grep -q -- '--retry-connrefused'; then BASE_FLAGS+=( --retry-connrefused ); fi
-          FAIL_FLAGS=( "${BASE_FLAGS[@]}" )
-          if "$CURL_BIN" --help 2>/dev/null | grep -q -- '--fail-with-body'; then
-            FAIL_FLAGS+=( --fail-with-body )
-          else
-            FAIL_FLAGS+=( --fail )
-          fi
-          CURL_NOFAIL() { "$CURL_BIN" "${BASE_FLAGS[@]}" "$@"; }
-          CURL_FAIL()   { "$CURL_BIN" "${FAIL_FLAGS[@]}" "$@"; }
+          # Perfil AUTO: sem --http1.1 (HTTP/2 quando disponível)
+          BASE_AUTO=( -sS --retry 3 --retry-delay 2 )
+          # Perfil H1: força HTTP/1.1 (para proxies/gateways chatos)
+          BASE_H1=( -sS --http1.1 --retry 3 --retry-delay 2 )
+
+          add_common_flags() {
+            local -n arr=$1
+            if "$CURL_BIN" --help 2>/dev/null | grep -q -- '--retry-all-errors'; then arr+=( --retry-all-errors ); fi
+            if "$CURL_BIN" --help 2>/dev/null | grep -q -- '--retry-connrefused'; then arr+=( --retry-connrefused ); fi
+          }
+          add_fail_flag() {
+            local -n arr=$1
+            if "$CURL_BIN" --help 2>/dev/null | grep -q -- '--fail-with-body'; then
+              arr+=( --fail-with-body )
+            else
+              arr+=( --fail )
+            fi
+          }
+
+          add_common_flags BASE_AUTO
+          add_common_flags BASE_H1
+
+          # Wrappers
+          CURL_AUTO_NOFAIL() { "$CURL_BIN" "${BASE_AUTO[@]}" "$@"; }
+          CURL_H1_NOFAIL()   { "$CURL_BIN" "${BASE_H1[@]}" "$@"; }
+
+          # Versões com fail rígido para POST de comment/attach
+          BASE_AUTO_FAIL=( "${BASE_AUTO[@]}" )
+          BASE_H1_FAIL=( "${BASE_H1[@]}" )
+          add_fail_flag BASE_AUTO_FAIL
+          add_fail_flag BASE_H1_FAIL
+          CURL_AUTO_FAIL() { "$CURL_BIN" "${BASE_AUTO_FAIL[@]}" "$@"; }
+          CURL_H1_FAIL()   { "$CURL_BIN" "${BASE_H1_FAIL[@]}" "$@"; }
 
           AUTH_B64="$(printf '%s:%s' "$JIRA_EMAIL" "$JIRA_API_TOKEN" | base64)"
 
@@ -345,37 +367,71 @@ jobs:
           | Pedidos totais | ${REQ} |
           MD
 
-          # ===== Descobrir Issue Type permitido (API v3, fallback v2) =====
-          META_URL_V3="$JIRA_BASE_URL/rest/api/3/issue/createmeta?projectKeys=$JIRA_PROJECT_KEY"
-          META_URL_V2="$JIRA_BASE_URL/rest/api/2/issue/createmeta?projectKeys=$JIRA_PROJECT_KEY"
+          # ===== Função utilitária para GET/POST com tentativa AUTO e fallback H1 =====
+          # Args: method url headers_file data_file out_json http_code_file allow_h1_retry_flag
+          http_try() {
+            local method="$1"; shift
+            local url="$1"; shift
+            local headers=("$1"); shift
+            local data_file="$1"; shift
+            local out_json="$1"; shift
+            local code_file="$1"; shift
+            local allow_h1_retry="$1"; shift
 
-          HTTP_CODE=$(CURL_NOFAIL -X GET "$META_URL_V3" \
-            -H "Authorization: Basic $AUTH_B64" -H "Accept: application/json" \
-            -w '%{http_code}' -o /tmp/jira_meta.json || true)
-          if [[ "$HTTP_CODE" -lt 200 || "$HTTP_CODE" -ge 300 || ! -s /tmp/jira_meta.json ]]; then
-            HTTP_CODE=$(CURL_NOFAIL -X GET "$META_URL_V2" \
-              -H "Authorization: Basic $AUTH_B64" -H "Accept: application/json" \
-              -w '%{http_code}' -o /tmp/jira_meta.json || true)
+            # 1ª tentativa: AUTO (HTTP/2 quando disponível)
+            if [[ -n "$data_file" ]]; then
+              HTTP_CODE=$(CURL_AUTO_NOFAIL -X "$method" "$url" $(cat "$headers") -d @"$data_file" -w '%{http_code}' -o "$out_json" || true)
+            else
+              HTTP_CODE=$(CURL_AUTO_NOFAIL -X "$method" "$url" $(cat "$headers") -w '%{http_code}' -o "$out_json" || true)
+            fi
+
+            echo -n "$HTTP_CODE" > "$code_file"
+
+            # Heurística: se 400–599 e o corpo INDICAR problema de protocolo específico de HTTP/1.1 (http1.codec_error),
+            # manter AUTO (não tentar H1). Caso contrário e se permitido, tentar H1.
+            if [[ "$HTTP_CODE" =~ ^[45] ]] && [[ "$allow_h1_retry" = "1" ]]; then
+              if grep -qi 'http1\.codec_error' "$out_json" 2>/dev/null; then
+                return 0
+              fi
+              # 2ª tentativa: H1
+              if [[ -n "$data_file" ]]; then
+                HTTP_CODE=$(CURL_H1_NOFAIL -X "$method" "$url" $(cat "$headers") -d @"$data_file" -w '%{http_code}' -o "$out_json" || true)
+              else
+                HTTP_CODE=$(CURL_H1_NOFAIL -X "$method" "$url" $(cat "$headers") -w '%{http_code}' -o "$out_json" || true)
+              fi
+              echo -n "$HTTP_CODE" > "$code_file"
+            fi
+          }
+
+          HDR_JSON=/tmp/h_j.json; : > "$HDR_JSON"
+          echo "-H" > /tmp/hs; echo "Authorization: Basic $AUTH_B64" >> /tmp/hs
+          echo "-H" >> /tmp/hs; echo "Accept: application/json" >> /tmp/hs
+          echo "-H" >> /tmp/hs; echo "Content-Type: application/json" >> /tmp/hs
+
+          # ===== Obter createmeta (tenta v3 depois v2), com AUTO e sem forçar H1 =====
+          META_V3="$JIRA_BASE_URL/rest/api/3/issue/createmeta?projectKeys=$JIRA_PROJECT_KEY"
+          META_V2="$JIRA_BASE_URL/rest/api/2/issue/createmeta?projectKeys=$JIRA_PROJECT_KEY"
+
+          http_try GET "$META_V3" /tmp/hs "" /tmp/jira_meta.json /tmp/jira_meta.code 0
+          CODE=$(cat /tmp/jira_meta.code)
+          if [[ ! "$CODE" =~ ^2 ]] || ! jq -e . >/dev/null 2>&1 < /tmp/jira_meta.json; then
+            http_try GET "$META_V2" /tmp/hs "" /tmp/jira_meta.json /tmp/jira_meta.code 0
+            CODE=$(cat /tmp/jira_meta.code)
           fi
-
           if ! jq -e . >/dev/null 2>&1 < /tmp/jira_meta.json; then
-            echo "[JIRA] Falha ao obter createmeta (HTTP $HTTP_CODE). Corpo:"
+            echo "[JIRA] Falha ao obter createmeta (HTTP $CODE). Corpo:"
             cat /tmp/jira_meta.json || true
             exit 1
           fi
 
-          ISSUE_TYPE_ID=$(jq -r '
-            .projects[0].issuetypes
-            | (map(select(.name=="Task"))[0].id // .[0].id // empty)
-          ' /tmp/jira_meta.json)
-
+          ISSUE_TYPE_ID=$(jq -r '.projects[0].issuetypes | (map(select(.name=="Task"))[0].id // .[0].id // empty)' /tmp/jira_meta.json)
           if [[ -z "${ISSUE_TYPE_ID:-}" ]]; then
-            echo "[JIRA] Não foi possível determinar um Issue Type válido. Meta:"
+            echo "[JIRA] Não foi possível determinar um Issue Type válido. Disponíveis:"
             jq -r '.projects[0].issuetypes[].name' /tmp/jira_meta.json || true
             exit 1
           fi
 
-          # ===== Construir payload e criar issue (tenta v3, fallback v2) =====
+          # ===== Criar issue (v3→v2) =====
           PAYLOAD=$(jq -n \
             --arg p "$JIRA_PROJECT_KEY" \
             --arg s "$SUMMARY" \
@@ -383,48 +439,62 @@ jobs:
             --arg it "$ISSUE_TYPE_ID" \
             '{fields:{project:{key:$p},summary:$s,description:$d,issuetype:{id:$it}}}')
 
+          echo "$PAYLOAD" > /tmp/jira_create_payload.json
+
           CREATE_URLS=("$JIRA_BASE_URL/rest/api/3/issue" "$JIRA_BASE_URL/rest/api/2/issue")
           ISSUE_KEY=""
           for URL in "${CREATE_URLS[@]}"; do
-            HTTP_CODE=$(CURL_NOFAIL -X POST "$URL" \
-              -H "Authorization: Basic $AUTH_B64" \
-              -H "Accept: application/json" \
-              -H "Content-Type: application/json" \
-              -d "$PAYLOAD" \
-              -w '%{http_code}' -o /tmp/jira_create.json || true)
-
-            if [[ "$HTTP_CODE" =~ ^2 ]]; then
+            http_try POST "$URL" /tmp/hs /tmp/jira_create_payload.json /tmp/jira_create.json /tmp/jira_create.code 1
+            CODE=$(cat /tmp/jira_create.code)
+            if [[ "$CODE" =~ ^2 ]]; then
               ISSUE_KEY=$(jq -r '.key // empty' /tmp/jira_create.json)
               [[ -n "$ISSUE_KEY" && "$ISSUE_KEY" != "null" ]] && break
             fi
           done
 
           if [[ -z "$ISSUE_KEY" ]]; then
-            echo "[JIRA] Criação falhou (HTTP $HTTP_CODE). Corpo de resposta:"
+            echo "[JIRA] Criação falhou (HTTP $CODE). Corpo de resposta:"
             cat /tmp/jira_create.json || true
             echo
             echo "[JIRA] Payload enviado:"
-            echo "$PAYLOAD"
+            cat /tmp/jira_create_payload.json
+            exit 1
+          fi
+          echo "[JIRA] Issue criada: $ISSUE_KEY"
+
+          # ===== Comentário e anexo (fail rígido); tentamos AUTO e, se 4xx/5xx sem codec_error, repetimos em H1 =====
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "$(jq -n --arg c "**Run:** $RUN_URL" '{body:$c}')" > /tmp/jira_comment.json
+
+          # Comentário
+          http_try POST "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE_KEY/comment" /tmp/hs /tmp/jira_comment.json /tmp/jira_comment.out /tmp/jira_comment.code 1
+          CODE=$(cat /tmp/jira_comment.code)
+          if [[ ! "$CODE" =~ ^2 ]]; then
+            echo "[JIRA] Comentário falhou (HTTP $CODE):"
+            cat /tmp/jira_comment.out || true
             exit 1
           fi
 
-          echo "[JIRA] Issue criada: $ISSUE_KEY"
+          # Anexo (usa multipart; sem Content-Type JSON)
+          HS_ATTACH=/tmp/hs_attach; : > "$HS_ATTACH"
+          echo "-H" > "$HS_ATTACH"; echo "Authorization: Basic $AUTH_B64" >> "$HS_ATTACH"
+          echo "-H" >> "$HS_ATTACH"; echo "Accept: application/json" >> "$HS_ATTACH"
+          echo "-H" >> "$HS_ATTACH"; echo "X-Atlassian-Token: no-check" >> "$HS_ATTACH"
 
-          # ===== Comentário com link ao run (falha rígida) =====
-          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          COMMENT=$(jq -n --arg c "**Run:** $RUN_URL" '{body:$c}')
-          CURL_FAIL -X POST "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE_KEY/comment" \
-            -H "Authorization: Basic $AUTH_B64" \
-            -H "Accept: application/json" \
-            -H "Content-Type: application/json" \
-            -d "$COMMENT" >/dev/null
-
-          # ===== Anexar summary.json (falha rígida) =====
-          CURL_FAIL -X POST "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE_KEY/attachments" \
-            -H "Authorization: Basic $AUTH_B64" \
-            -H "X-Atlassian-Token: no-check" \
-            -H "Accept: application/json" \
-            -F "file=@results/summary.json" >/dev/null
+          # AUTO
+          CODE=$(CURL_AUTO_NOFAIL -X POST "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE_KEY/attachments" \
+            $(cat "$HS_ATTACH") -F "file=@results/summary.json" -w '%{http_code}' -o /tmp/jira_attach.out || true)
+          if [[ ! "$CODE" =~ ^2 ]]; then
+            if ! grep -qi 'http1\.codec_error' /tmp/jira_attach.out 2>/dev/null; then
+              CODE=$(CURL_H1_NOFAIL -X POST "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE_KEY/attachments" \
+                $(cat "$HS_ATTACH") -F "file=@results/summary.json" -w '%{http_code}' -o /tmp/jira_attach.out || true)
+            fi
+          fi
+          if [[ ! "$CODE" =~ ^2 ]]; then
+            echo "[JIRA] Anexo falhou (HTTP $CODE):"
+            cat /tmp/jira_attach.out || true
+            exit 1
+          fi
 
           echo "[JIRA] Comentário e anexo enviados."
 
