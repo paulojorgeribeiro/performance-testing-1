@@ -1,5 +1,4 @@
 name: Performance Test
-description: Run performance tests from a config file and publish results.
 
 on:
   workflow_dispatch:
@@ -9,21 +8,20 @@ on:
         required: true
         default: "dev"
       CONFIG_PATH:
-        description: "Caminho do YAML (YAML Ain't Markup Language) do teste (ex.: configs/TEST.0001.yml)"
+        description: "Caminho do YAML do teste (ex.: configs/TEST.0001.yml)"
         required: true
         default: "configs/TEST.0001.yml"
 
 jobs:
   performance-test:
-    runs-on: self-hosted  # (repor labels quando o runner tiver as mesmas)
+    name: Performance Testing Pipeline
+    runs-on: self-hosted
     timeout-minutes: 600
 
-    # Garante Bash em todos os passos deste job
     defaults:
       run:
         shell: bash
 
-    # Permissões mínimas; o GitHub fornece github.token por omissão
     permissions:
       contents: read
 
@@ -37,7 +35,7 @@ jobs:
         run: |
           echo "CONTAINERS_STORAGE_DRIVER=vfs" >> "$GITHUB_ENV"
 
-      # 0) "docker" → Podman remoto (API do host via 8666, com fallback slirp4netns)
+      # 0) "docker" → Podman remoto (API do host via 8666, com fallback)
       - name: Make docker shim for Podman (remote API)
         run: |
           echo 'PODMAN_HOST=tcp://host.containers.internal:8666' >> "$GITHUB_ENV"
@@ -54,11 +52,11 @@ jobs:
           echo "$HOME/bin" >> "$GITHUB_PATH"
 
       # 1) Checkout
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       # 1.1) Set environment mode (DEV/PROD)
-      - name: Set environment mode (DEV/PROD)
+      - name: Setup Environment (DEV/PROD)
         run: |
           set -euo pipefail
           echo "[INFO] Selected mode: ${MODE}"
@@ -70,7 +68,6 @@ jobs:
             echo "DPT_REGISTRY_URL=" >> "$GITHUB_ENV"
             echo "API_VERSION=" >> "$GITHUB_ENV"
           else
-            # ⚠️ Em PROD: defina estes secrets/vars no GitHub
             echo "VAULT_ADDR=${{ secrets.VAULT_PROD_ADDR }}" >> "$GITHUB_ENV"
             echo "VAULT_TOKEN=${{ secrets.VAULT_PROD_TOKEN }}" >> "$GITHUB_ENV"
             echo "AUTHENTICATION=app" >> "$GITHUB_ENV"
@@ -79,7 +76,7 @@ jobs:
             echo "API_VERSION=${{ vars.DPT_API_VERSION }}" >> "$GITHUB_ENV"
           fi
 
-      # 1.2) Instalar yq (parser de YAML) e jq (JSON Query)
+      # 1.2) Instalar yq e jq
       - name: Install yq and jq
         run: |
           set -euo pipefail
@@ -91,20 +88,19 @@ jobs:
             if command -v apt-get >/dev/null 2>&1; then
               sudo apt-get update -y && sudo apt-get install -y jq
             else
-              echo "[WARN] jq ausente e sem apt-get; garante jq no runner." >&2
+              echo "[WARN] jq ausente; garante jq no runner." >&2
             fi
           fi
           yq --version || true
           jq --version || true
 
       # 1.3) Carregar a config YAML e exportar variáveis
-      - name: Load test config
+      - name: Load Test Configuration
         run: |
           set -euo pipefail
           CFG="${{ inputs.CONFIG_PATH }}"
           test -f "$CFG" || { echo "Config não encontrada: $CFG"; exit 1; }
 
-          # 1) Ler YAML para variáveis locais
           LAC_ID=$(yq -r '.lac_id' "$CFG")
           TEST_ID=$(yq -r '.test_id' "$CFG")
           BASE_URL=$(yq -r '.target.base_url' "$CFG")
@@ -115,7 +111,6 @@ jobs:
           LABEL_SYS=$(yq -r '.labels.system' "$CFG")
           LABEL_NOTES=$(yq -r '.labels.notes' "$CFG")
 
-          # 2) Exportar para próximos steps
           {
             echo "LAC_ID=$LAC_ID"
             echo "TEST_ID=$TEST_ID"
@@ -128,11 +123,10 @@ jobs:
             echo "LABEL_NOTES=$LABEL_NOTES"
           } >> "$GITHUB_ENV"
 
-          # 3) Log amigável neste step
           echo "[cfg] Carregado ${LAC_ID}/${TEST_ID} @ ${BASE_URL}"
 
       # 2) Sanity – confirmar Podman remoto e paths
-      - name: Sanity check (remote podman & paths)
+      - name: Sanity Check (remote podman & paths)
         run: |
           set -euo pipefail
           podman --remote --url "$PODMAN_HOST" info || true
@@ -141,12 +135,12 @@ jobs:
           ls -la "${GITHUB_WORKSPACE}/shell" || true
           echo "MODE=${MODE}"
 
-      # 2.5) (DEV) Seed Vault automático para ptp_api_key (idempotente)
+      # 2.5) (DEV) Seed Vault automático
       - name: Seed Vault DEV (idempotent)
         if: ${{ env.MODE == 'dev' }}
         run: |
           set -euo pipefail
-          VAULT_ENDPOINT="${VAULT_ADDR:-${VAULT_URL:-http://host.containers.internal:18200}}"
+          VAULT_ENDPOINT="${VAULT_ADDR:-http://host.containers.internal:18200}"
           echo "[seed] Endpoint: $VAULT_ENDPOINT"
           curl -sS -H "X-Vault-Token: ${VAULT_TOKEN}" -H "Content-Type: application/json" \
                -X POST "$VAULT_ENDPOINT/v1/sys/mounts/devplatforms" \
@@ -165,52 +159,34 @@ jobs:
           cat > shell/run-test.sh <<'SH'
           #!/usr/bin/env bash
           set -euo pipefail
-
           echo "[INFO] Starting test run..."
-          echo "[INFO] Defining runtime variables..."
-
           GITHUB_TOKEN="${1}"; REPO="${2}"; LAC_ID="${3}"; TEST_ID="${4}"; TEST_HOME="${5}";
           USER_NAME="${6}"; GITHUB_REF_NAME="${7}"; VAULT_TOKEN="${8}";
           AUTHENTICATION="${9:-none}"; SCRIPT_VERSION="${10:-}"
-
           SHELL_DIR="${TEST_HOME}/shell"
           LIB_PATH="${SHELL_DIR}/run-test-lib.sh"
           if [[ ! -f "${LIB_PATH}" ]]; then echo "[ERROR] Failed to load libs"; exit 1; fi
-          # shellcheck disable=SC1090
           source "${LIB_PATH}"
-
           VAULT_ENDPOINT="${VAULT_ADDR:-${VAULT_URL:-}}"
-          if [[ -z "${VAULT_ENDPOINT}" ]]; then
-            echo "[ERROR] VAULT_ADDR/VAULT_URL não definido."
-            exit 1
-          fi
+          if [[ -z "${VAULT_ENDPOINT}" ]]; then echo "[ERROR] VAULT_ADDR/VAULT_URL não definido."; exit 1; fi
           echo "[INFO] Using Vault endpoint: ${VAULT_ENDPOINT}"
-
           echo "[INFO] Fetching PTP_API_KEY from Vault..."
-          PTP_API_KEY=$(curl -sS \
-            --header "X-Vault-Token: ${VAULT_TOKEN}" \
+          PTP_API_KEY=$(curl -sS --header "X-Vault-Token: ${VAULT_TOKEN}" \
             --request GET "${VAULT_ENDPOINT}/v1/devplatforms/data/performance-platform/application" \
             | jq -r '.data.data.ptp_api_key // empty')
           if [[ -z "${PTP_API_KEY}" ]]; then echo "[ERROR] Failed to retrieve API_KEY from Vault."; exit 1; fi
           export PTP_API_KEY
-
-          if [[ "${AUTHENTICATION}" != "none" ]]; then
-            echo "[INFO] Authentication mode: ${AUTHENTICATION}"
-          else
-            echo "[INFO] Skipping GitHub App authentication in DEV (AUTHENTICATION=none)."
+          if [[ "${AUTHENTICATION}" = "none" ]]; then
+            echo "[INFO] Skipping GitHub App authentication in DEV."
           fi
-
           curl -sS --request POST -H "X-Vault-Token: ${VAULT_TOKEN}" \
             "${VAULT_ENDPOINT}/v1/auth/token/renew-self" >/dev/null || true
           echo "[INFO] Vault token renew attempted."
-
           echo "[INFO] Fetching test-definition.json..."
-          curl -sS -H "Authorization: token ${GITHUB_TOKEN}" \
-               -H "Accept: application/vnd.github.v3.raw" \
+          curl -sS -H "Authorization: token ${GITHUB_TOKEN}" -H "Accept: application/vnd.github.v3.raw" \
                -o test-definition.json \
                "https://api.github.com/repos/${REPO}/contents/${TEST_HOME}/${LAC_ID}/${TEST_ID}/test-definition.json?ref=${GITHUB_REF_NAME}"
           if [[ ! -s test-definition.json ]] ; then echo "[ERROR] test-definition.json not found"; exit 1; fi
-
           for TYPE in $(jq -r '.test | keys[]' test-definition.json); do
             case "${TYPE}" in
               performance)
@@ -230,12 +206,11 @@ jobs:
                 echo "[ERROR] Unsupported test type: ${TYPE}"; exit 1;;
             esac
           done
-
           echo "[INFO] Test run completed."
           SH
           chmod +x shell/run-test.sh
 
-      # 3) Permissões de execução
+      # 3) Permissões
       - name: Make scripts executable
         working-directory: ${{ github.workspace }}
         run: |
@@ -251,10 +226,9 @@ jobs:
           set -euo pipefail
           VAULT_ENDPOINT="${VAULT_ADDR:-${VAULT_URL:-}}"
           echo "[diag] VAULT_ENDPOINT=$VAULT_ENDPOINT"
-          echo "[diag] Testar saúde do Vault..."
           curl -sS "$VAULT_ENDPOINT/v1/sys/health" || (echo "[diag] Falha a aceder ao Vault" && exit 1)
 
-      # 4) Running test (usa LAC_ID/TEST_ID da config YAML)
+      # 4) Running test
       - name: Running test
         env:
           PERFORMANCE_HOME: ${{ github.workspace }}
@@ -263,7 +237,6 @@ jobs:
         run: |
           set -euo pipefail
           echo "Running performance test ${TEST_ID} on LAC ${LAC_ID}"
-          # disponibilizar config aos scripts
           export BASE_URL DURATION_S RPS CONCURRENCY LABEL_ENV LABEL_SYS LABEL_NOTES
           bash shell/run-test.sh \
             "${{ github.token }}" \
@@ -276,16 +249,14 @@ jobs:
             "${VAULT_TOKEN}" \
             "${AUTHENTICATION}"
 
-      # 4.1) Gerar summary.json (usa CSV em results/raw se existir; senão usa envs)
+      # 4.1) Gerar summary.json
       - name: Build results summary
         run: |
           set -euo pipefail
-          # Se o teu teste já expõe métricas em variáveis, exporta-as aqui (opcional):
-          # export THROUGHPUT_RPS=150; export P95_MS=420; export AVG_MS=210; export ERROR_PCT=0.5; export DURATION_S=300; export REQUESTS_TOTAL=45000
           bash shell/report-summary.sh "${LAC_ID}" "${TEST_ID}" "results"
           test -s results/summary.json
 
-      # 4.2) Publicar artefactos (summary + brutos)
+      # 4.2) Publicar artefactos
       - name: Upload results artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -295,7 +266,7 @@ jobs:
             results/raw/**
           if-no-files-found: warn
 
-      # 4.3) Sumário imediato no GitHub Actions (Markdown)
+      # 4.3) Sumário no GitHub
       - name: Write run summary
         run: |
           set -euo pipefail
@@ -304,17 +275,19 @@ jobs:
           ERR=$(jq -r '.metrics.error_rate_pct' results/summary.json)
           DUR=$(jq -r '.metrics.duration_s' results/summary.json)
           REQ=$(jq -r '.metrics.requests_total' results/summary.json)
-          echo "## Resultados — ${LAC_ID} / ${TEST_ID}" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Métrica | Valor |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---:|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Throughput (RPS, Requests Per Second) | $THR |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| P95 Latência (ms) | $P95 |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Taxa de Erro (%) | $ERR |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Duração (s) | $DUR |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Pedidos totais | $REQ |" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Resultados — ${LAC_ID} / ${TEST_ID}"
+            echo
+            echo "| Métrica | Valor |"
+            echo "|---|---:|"
+            echo "| Throughput (RPS) | $THR |"
+            echo "| P95 Latência (ms) | $P95 |"
+            echo "| Taxa de Erro (%) | $ERR |"
+            echo "| Duração (s) | $DUR |"
+            echo "| Pedidos totais | $REQ |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      # 4.4) Publicar no JIRA (JIRA não interpreta Markdown por defeito; usa plain text)
+      # 4.4) Publicar no JIRA (força HTTP/1.1 para evitar PROTOCOL_ERROR)
       - name: Publish to JIRA
         env:
           JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
@@ -323,15 +296,12 @@ jobs:
           JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
         run: |
           set -euo pipefail
-
-          # Pré-requisitos
           test -s results/summary.json
           command -v jq >/dev/null || { echo "jq em falta"; exit 1; }
 
-          # Auth Jira Cloud (Basic Auth)
+          CURL="curl -sS --http1.1 --retry 3 --retry-all-errors --fail-with-body"
           AUTH="$(printf '%s:%s' "$JIRA_EMAIL" "$JIRA_API_TOKEN" | base64)"
 
-          # Extrair métricas
           THR=$(jq -r '.metrics.throughput_rps' results/summary.json)
           P95=$(jq -r '.metrics.p95_latency_ms' results/summary.json)
           ERR=$(jq -r '.metrics.error_rate_pct' results/summary.json)
@@ -341,7 +311,6 @@ jobs:
 
           SUMMARY="Perf: ${LAC_ID}/${TEST_ID} @ ${LABEL_ENV:-dev} (run ${{ github.run_id }})"
 
-          # Descrição (plain text; variáveis expandidas)
           read -r -d '' DESC <<MD || true
           Performance Test
           - LAC: ${LAC_ID}
@@ -355,47 +324,40 @@ jobs:
           Metrics
           | Métrica | Valor |
           |---|---:|
-          | Throughput (RPS, Requests Per Second) | ${THR} |
+          | Throughput (RPS) | ${THR} |
           | P95 Latência (ms) | ${P95} |
           | Taxa de Erro (%) | ${ERR} |
           | Duração (s) | ${DUR} |
           | Pedidos totais | ${REQ} |
           MD
 
-          # 1) Criar Issue
-          CREATE_PAYLOAD=$(jq -n --arg p "$JIRA_PROJECT_KEY" --arg s "$SUMMARY" --arg d "$DESC" '{
-            fields: {
-              project: { key: $p },
-              summary: $s,
-              description: $d,
-              issuetype: { name: "Task" }
-            }
-          }')
+          PAYLOAD=$(jq -n --arg p "$JIRA_PROJECT_KEY" --arg s "$SUMMARY" --arg d "$DESC" \
+            '{fields:{project:{key:$p},summary:$s,description:$d,issuetype:{name:"Task"}}}')
 
-          CREATE_RES=$(curl -sS -X POST "$JIRA_BASE_URL/rest/api/2/issue" \
+          CREATE_RES=$($CURL -X POST "$JIRA_BASE_URL/rest/api/2/issue" \
             -H "Authorization: Basic $AUTH" \
+            -H "Accept: application/json" \
             -H "Content-Type: application/json" \
-            -d "$CREATE_PAYLOAD")
-
+            -d "$PAYLOAD")
           ISSUE_KEY=$(echo "$CREATE_RES" | jq -r '.key // empty')
-          if [ -z "$ISSUE_KEY" ] || [ "$ISSUE_KEY" = "null" ]; then
+          if [[ -z "$ISSUE_KEY" || "$ISSUE_KEY" = "null" ]]; then
             echo "[JIRA] Falhou a criação: $CREATE_RES"
             exit 1
           fi
           echo "[JIRA] Issue criada: $ISSUE_KEY"
 
-          # 2) Comentar com link da run
           RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          COMMENT=$(jq -n --arg c "**Run:** $RUN_URL" '{body: $c}')
-          curl -sS -X POST "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE_KEY/comment" \
+          COMMENT=$(jq -n --arg c "**Run:** $RUN_URL" '{body:$c}')
+          $CURL -X POST "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE_KEY/comment" \
             -H "Authorization: Basic $AUTH" \
+            -H "Accept: application/json" \
             -H "Content-Type: application/json" \
             -d "$COMMENT" >/dev/null
 
-          # 3) Anexar summary.json
-          curl -sS -X POST "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE_KEY/attachments" \
+          $CURL -X POST "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE_KEY/attachments" \
             -H "Authorization: Basic $AUTH" \
             -H "X-Atlassian-Token: no-check" \
+            -H "Accept: application/json" \
             -F "file=@results/summary.json" >/dev/null
 
           echo "[JIRA] Comentário e anexo enviados."
