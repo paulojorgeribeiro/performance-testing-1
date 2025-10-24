@@ -272,7 +272,7 @@ jobs:
             echo "| Pedidos totais | $REQ |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # 4.4) Publicar no JIRA (fix de headers em arrays + AUTO↔H1 + v3→v2)
+      # 4.4) Publicar no JIRA (força HTTP/1.1 + headers em arrays + v3→v2)
       - name: Publish to JIRA
         env:
           JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
@@ -285,20 +285,27 @@ jobs:
           command -v jq >/dev/null || { echo "jq em falta"; exit 1; }
 
           CURL_BIN="curl"
-          AUTO_FLAGS=( -sS --retry 3 --retry-delay 2 )
-          H1_FLAGS=( -sS --http1.1 --retry 3 --retry-delay 2 )
-          "$CURL_BIN" --help 2>/dev/null | grep -q -- '--retry-all-errors' && AUTO_FLAGS+=( --retry-all-errors ) && H1_FLAGS+=( --retry-all-errors )
-          "$CURL_BIN" --help 2>/dev/null | grep -q -- '--retry-connrefused' && AUTO_FLAGS+=( --retry-connrefused ) && H1_FLAGS+=( --retry-connrefused )
-
-          CURL_AUTO() { "$CURL_BIN" "${AUTO_FLAGS[@]}" "$@"; }
-          CURL_H1()   { "$CURL_BIN" "${H1_FLAGS[@]}" "$@"; }
+          # Força HTTP/1.1 para evitar PROTOCOL_ERROR em HTTP/2
+          BASE_FLAGS=( -sS --http1.1 --retry 3 --retry-delay 2 )
+          "$CURL_BIN" --help 2>/dev/null | grep -q -- '--retry-all-errors' && BASE_FLAGS+=( --retry-all-errors )
+          "$CURL_BIN" --help 2>/dev/null | grep -q -- '--retry-connrefused' && BASE_FLAGS+=( --retry-connrefused )
+          # Para chamadas críticas, falhar com corpo se suportado
+          FAIL_FLAGS=( "${BASE_FLAGS[@]}" )
+          if "$CURL_BIN" --help 2>/dev/null | grep -q -- '--fail-with-body'; then
+            FAIL_FLAGS+=( --fail-with-body )
+          else
+            FAIL_FLAGS+=( --fail )
+          fi
+          CURL()      { "$CURL_BIN" "${BASE_FLAGS[@]}" "$@"; }
+          CURL_FAIL() { "$CURL_BIN" "${FAIL_FLAGS[@]}" "$@"; }
 
           AUTH_B64="$(printf '%s:%s' "$JIRA_EMAIL" "$JIRA_API_TOKEN" | base64)"
 
-          # Headers como arrays: cada -H "chave: valor" é um argumento único
+          # Headers como arrays (cada -H é um argumento)
           HDR_JSON=( -H "Authorization: Basic $AUTH_B64" -H "Accept: application/json" -H "Content-Type: application/json" )
-          HDR_JSON_NOCT=( -H "Authorization: Basic $AUTH_B64" -H "Accept: application/json" )
+          HDR_NOCT=(  -H "Authorization: Basic $AUTH_B64" -H "Accept: application/json" )
 
+          # Métricas (expandir siglas na primeira menção)
           THR=$(jq -r '.metrics.throughput_rps' results/summary.json)   # RPS (Requests Per Second — pedidos por segundo)
           P95=$(jq -r '.metrics.p95_latency_ms' results/summary.json)   # P95 (Percentil 95) de latência em ms
           ERR=$(jq -r '.metrics.error_rate_pct' results/summary.json)   # Taxa de erro (%)
@@ -328,23 +335,13 @@ jobs:
           | Pedidos totais | ${REQ} |
           MD
 
-          # createmeta v3 → v2 (AUTO; se 4xx/5xx e não for codec_error, tenta H1)
+          # 1) Obter createmeta (v3 → v2)
           META_V3="$JIRA_BASE_URL/rest/api/3/issue/createmeta?projectKeys=$JIRA_PROJECT_KEY"
           META_V2="$JIRA_BASE_URL/rest/api/2/issue/createmeta?projectKeys=$JIRA_PROJECT_KEY"
 
-          CODE=$(CURL_AUTO -X GET "$META_V3" "${HDR_JSON[@]}" -w '%{http_code}' -o /tmp/jira_meta.json || true)
+          CODE=$(CURL -X GET "$META_V3" "${HDR_JSON[@]}" -w '%{http_code}' -o /tmp/jira_meta.json || true)
           if [[ ! "$CODE" =~ ^2 ]] || ! jq -e . >/dev/null 2>&1 < /tmp/jira_meta.json; then
-            if ! grep -qi 'http1\.codec_error' /tmp/jira_meta.json 2>/dev/null; then
-              CODE=$(CURL_H1 -X GET "$META_V3" "${HDR_JSON[@]}" -w '%{http_code}' -o /tmp/jira_meta.json || true)
-            fi
-          fi
-          if [[ ! "$CODE" =~ ^2 ]] || ! jq -e . >/dev/null 2>&1 < /tmp/jira_meta.json; then
-            CODE=$(CURL_AUTO -X GET "$META_V2" "${HDR_JSON[@]}" -w '%{http_code}' -o /tmp/jira_meta.json || true)
-            if [[ ! "$CODE" =~ ^2 ]] || ! jq -e . >/dev/null 2>&1 < /tmp/jira_meta.json; then
-              if ! grep -qi 'http1\.codec_error' /tmp/jira_meta.json 2>/dev/null; then
-                CODE=$(CURL_H1 -X GET "$META_V2" "${HDR_JSON[@]}" -w '%{http_code}' -o /tmp/jira_meta.json || true)
-              fi
-            end
+            CODE=$(CURL -X GET "$META_V2" "${HDR_JSON[@]}" -w '%{http_code}' -o /tmp/jira_meta.json || true)
           fi
           if ! jq -e . >/dev/null 2>&1 < /tmp/jira_meta.json; then
             echo "[JIRA] Falha ao obter createmeta (HTTP $CODE). Corpo:"
@@ -359,24 +356,21 @@ jobs:
             exit 1
           fi
 
+          # 2) Criar issue (v3 → v2)
           PAYLOAD=$(jq -n --arg p "$JIRA_PROJECT_KEY" --arg s "$SUMMARY" --arg d "$DESC" --arg it "$ISSUE_TYPE_ID" \
             '{fields:{project:{key:$p},summary:$s,description:$d,issuetype:{id:$it}}}')
           echo "$PAYLOAD" > /tmp/jira_create_payload.json
 
           ISSUE_KEY=""
           for URL in "$JIRA_BASE_URL/rest/api/3/issue" "$JIRA_BASE_URL/rest/api/2/issue"; do
-            CODE=$(CURL_AUTO -X POST "$URL" "${HDR_JSON[@]}" -d @/tmp/jira_create_payload.json -w '%{http_code}' -o /tmp/jira_create.json || true)
-            if [[ ! "$CODE" =~ ^2 ]] && ! grep -qi 'http1\.codec_error' /tmp/jira_create.json 2>/dev/null; then
-              CODE=$(CURL_H1 -X POST "$URL" "${HDR_JSON[@]}" -d @/tmp/jira_create_payload.json -w '%{http_code}' -o /tmp/jira_create.json || true)
-            fi
+            CODE=$(CURL -X POST "$URL" "${HDR_JSON[@]}" -d @/tmp/jira_create_payload.json -w '%{http_code}' -o /tmp/jira_create.json || true)
             if [[ "$CODE" =~ ^2 ]]; then
               ISSUE_KEY=$(jq -r '.key // empty' /tmp/jira_create.json)
               [[ -n "$ISSUE_KEY" && "$ISSUE_KEY" != "null" ]] && break
             fi
           done
-
           if [[ -z "$ISSUE_KEY" ]]; then
-            echo "[JIRA] Criação falhou (HTTP $CODE). Corpo de resposta:"
+            echo "[JIRA] Criação falhou (HTTP $CODE). Corpo:"
             cat /tmp/jira_create.json || true
             echo "[JIRA] Payload:"
             cat /tmp/jira_create_payload.json
@@ -384,35 +378,18 @@ jobs:
           fi
           echo "[JIRA] Issue criada: $ISSUE_KEY"
 
+          # 3) Comentário com link ao run (falha rígida)
           RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           COMMENT=$(jq -n --arg c "**Run:** $RUN_URL" '{body:$c}')
           echo "$COMMENT" > /tmp/jira_comment.json
 
-          # Comentário
-          CODE=$(CURL_AUTO -X POST "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE_KEY/comment" "${HDR_JSON[@]}" -d @/tmp/jira_comment.json -w '%{http_code}' -o /tmp/jira_comment.out || true)
-          if [[ ! "$CODE" =~ ^2 ]] && ! grep -qi 'http1\.codec_error' /tmp/jira_comment.out 2>/dev/null; then
-            CODE=$(CURL_H1 -X POST "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE_KEY/comment" "${HDR_JSON[@]}" -d @/tmp/jira_comment.json -w '%{http_code}' -o /tmp/jira_comment.out || true)
-          fi
-          if [[ ! "$CODE" =~ ^2 ]]; then
-            echo "[JIRA] Comentário falhou (HTTP $CODE):"
-            cat /tmp/jira_comment.out || true
-            exit 1
-          fi
+          CURL_FAIL -X POST "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE_KEY/comment" \
+            "${HDR_JSON[@]}" -d @/tmp/jira_comment.json >/dev/null
 
-          # Anexo (multipart)
-          CODE=$(CURL_AUTO -X POST "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE_KEY/attachments" \
-            "${HDR_JSON_NOCT[@]}" -H "X-Atlassian-Token: no-check" -F "file=@results/summary.json" \
-            -w '%{http_code}' -o /tmp/jira_attach.out || true)
-          if [[ ! "$CODE" =~ ^2 ]] && ! grep -qi 'http1\.codec_error' /tmp/jira_attach.out 2>/dev/null; then
-            CODE=$(CURL_H1 -X POST "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE_KEY/attachments" \
-              "${HDR_JSON_NOCT[@]}" -H "X-Atlassian-Token: no-check" -F "file=@results/summary.json" \
-              -w '%{http_code}' -o /tmp/jira_attach.out || true)
-          fi
-          if [[ ! "$CODE" =~ ^2 ]]; then
-            echo "[JIRA] Anexo falhou (HTTP $CODE):"
-            cat /tmp/jira_attach.out || true
-            exit 1
-          fi
+          # 4) Anexo summary.json (multipart; sem Content-Type JSON)
+          CURL_FAIL -X POST "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE_KEY/attachments" \
+            "${HDR_NOCT[@]}" -H "X-Atlassian-Token: no-check" \
+            -F "file=@results/summary.json" >/dev/null
 
           echo "[JIRA] Comentário e anexo enviados."
 
