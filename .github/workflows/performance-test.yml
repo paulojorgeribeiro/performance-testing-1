@@ -9,7 +9,7 @@ on:
         required: true
         default: "dev"
       CONFIG_PATH:
-        description: "Caminho do YAML do teste (ex.: configs/TEST.0001.yml)"
+        description: "Caminho do YAML (YAML Ain't Markup Language) do teste (ex.: configs/TEST.0001.yml)"
         required: true
         default: "configs/TEST.0001.yml"
 
@@ -17,6 +17,16 @@ jobs:
   performance-test:
     runs-on: self-hosted  # (repor labels quando o runner tiver as mesmas)
     timeout-minutes: 600
+
+    # Garante Bash em todos os passos deste job
+    defaults:
+      run:
+        shell: bash
+
+    # Permissões mínimas; o GitHub fornece github.token por omissão
+    permissions:
+      contents: read
+
     env:
       MODE: ${{ inputs.ENVIRONMENT }}   # dev|prod
       AUTHENTICATION: none              # em prod pode mudar para "app"
@@ -50,6 +60,7 @@ jobs:
       # 1.1) Set environment mode (DEV/PROD)
       - name: Set environment mode (DEV/PROD)
         run: |
+          set -euo pipefail
           echo "[INFO] Selected mode: ${MODE}"
           if [[ "${MODE}" == "dev" ]]; then
             echo "VAULT_ADDR=http://host.containers.internal:18200" >> "$GITHUB_ENV"
@@ -68,12 +79,23 @@ jobs:
             echo "API_VERSION=${{ vars.DPT_API_VERSION }}" >> "$GITHUB_ENV"
           fi
 
-      # 1.2) Instalar yq (parser de YAML)
-      - name: Install yq (YAML parser)
+      # 1.2) Instalar yq (parser de YAML) e jq (JSON Query)
+      - name: Install yq and jq
         run: |
-          curl -sSL https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o /usr/local/bin/yq
-          chmod +x /usr/local/bin/yq
-          yq --version
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          curl -sSL https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o "$HOME/bin/yq"
+          chmod +x "$HOME/bin/yq"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          if ! command -v jq >/dev/null 2>&1; then
+            if command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get update -y && sudo apt-get install -y jq
+            else
+              echo "[WARN] jq ausente e sem apt-get; garante jq no runner." >&2
+            fi
+          fi
+          yq --version || true
+          jq --version || true
 
       # 1.3) Carregar a config YAML e exportar variáveis
       - name: Load test config
@@ -112,6 +134,7 @@ jobs:
       # 2) Sanity – confirmar Podman remoto e paths
       - name: Sanity check (remote podman & paths)
         run: |
+          set -euo pipefail
           podman --remote --url "$PODMAN_HOST" info || true
           docker --version || true
           echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
@@ -137,6 +160,7 @@ jobs:
       - name: Patch run-test.sh (prefer VAULT_ADDR; fallback VAULT_URL)
         working-directory: ${{ github.workspace }}
         run: |
+          set -euo pipefail
           mv shell/run-test.sh shell/run-test.orig.sh
           cat > shell/run-test.sh <<'SH'
           #!/usr/bin/env bash
@@ -215,6 +239,7 @@ jobs:
       - name: Make scripts executable
         working-directory: ${{ github.workspace }}
         run: |
+          set -euo pipefail
           chmod +x shell/run-test.sh || true
           chmod +x shell/run-test-performance-jmeter.sh || true
           chmod +x shell/cleanup-remote-job.sh || true
@@ -236,11 +261,12 @@ jobs:
           AUTHENTICATION: ${{ env.AUTHENTICATION }}
         working-directory: ${{ github.workspace }}
         run: |
+          set -euo pipefail
           echo "Running performance test ${TEST_ID} on LAC ${LAC_ID}"
           # disponibilizar config aos scripts
           export BASE_URL DURATION_S RPS CONCURRENCY LABEL_ENV LABEL_SYS LABEL_NOTES
           bash shell/run-test.sh \
-            "${{ secrets.GITHUB_TOKEN }}" \
+            "${{ github.token }}" \
             "${{ github.repository }}" \
             "${LAC_ID}" \
             "${TEST_ID}" \
@@ -253,6 +279,7 @@ jobs:
       # 4.1) Gerar summary.json (usa CSV em results/raw se existir; senão usa envs)
       - name: Build results summary
         run: |
+          set -euo pipefail
           # Se o teu teste já expõe métricas em variáveis, exporta-as aqui (opcional):
           # export THROUGHPUT_RPS=150; export P95_MS=420; export AVG_MS=210; export ERROR_PCT=0.5; export DURATION_S=300; export REQUESTS_TOTAL=45000
           bash shell/report-summary.sh "${LAC_ID}" "${TEST_ID}" "results"
@@ -271,7 +298,7 @@ jobs:
       # 4.3) Sumário imediato no GitHub Actions (Markdown)
       - name: Write run summary
         run: |
-          # Se faltar jq na tua imagem, instala: sudo apt-get update && sudo apt-get install -y jq
+          set -euo pipefail
           THR=$(jq -r '.metrics.throughput_rps' results/summary.json)
           P95=$(jq -r '.metrics.p95_latency_ms' results/summary.json)
           ERR=$(jq -r '.metrics.error_rate_pct' results/summary.json)
@@ -281,13 +308,13 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Métrica | Valor |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---:|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Throughput (RPS) | $THR |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Throughput (RPS, Requests Per Second) | $THR |" >> "$GITHUB_STEP_SUMMARY"
           echo "| P95 Latência (ms) | $P95 |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Taxa de Erro (%) | $ERR |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Duração (s) | $DUR |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Pedidos totais | $REQ |" >> "$GITHUB_STEP_SUMMARY"
 
-      # 4.4) Publicar no JIRA: criar issue, comentar métricas e anexar summary.json
+      # 4.4) Publicar no JIRA (JIRA não interpreta Markdown por defeito; usa plain text)
       - name: Publish to JIRA
         env:
           JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
@@ -297,14 +324,14 @@ jobs:
         run: |
           set -euo pipefail
 
-      # Pré-requisitos
+          # Pré-requisitos
           test -s results/summary.json
           command -v jq >/dev/null || { echo "jq em falta"; exit 1; }
 
-      # Auth Jira Cloud (Basic Auth)
+          # Auth Jira Cloud (Basic Auth)
           AUTH="$(printf '%s:%s' "$JIRA_EMAIL" "$JIRA_API_TOKEN" | base64)"
 
-      # Extrair métricas
+          # Extrair métricas
           THR=$(jq -r '.metrics.throughput_rps' results/summary.json)
           P95=$(jq -r '.metrics.p95_latency_ms' results/summary.json)
           ERR=$(jq -r '.metrics.error_rate_pct' results/summary.json)
@@ -314,28 +341,28 @@ jobs:
 
           SUMMARY="Perf: ${LAC_ID}/${TEST_ID} @ ${LABEL_ENV:-dev} (run ${{ github.run_id }})"
 
-     # Descrição Markdown
-          read -r -d '' DESC <<'MD' || true
-          **Performance Test**
-          - LAC: `${LAC_ID}`
-          - TEST: `${TEST_ID}`
-          - Environment: `${LABEL_ENV:-}`
-          - System: `${LABEL_SYS:-}`
-          - Notes: `${LABEL_NOTES:-}`
-          - Timestamp (UTC): `${TS}`
-          - Base URL: `${BASE_URL:-}`
+          # Descrição (plain text; variáveis expandidas)
+          read -r -d '' DESC <<MD || true
+          Performance Test
+          - LAC: ${LAC_ID}
+          - TEST: ${TEST_ID}
+          - Environment: ${LABEL_ENV:-}
+          - System: ${LABEL_SYS:-}
+          - Notes: ${LABEL_NOTES:-}
+          - Timestamp (UTC): ${TS}
+          - Base URL: ${BASE_URL:-}
 
-          **Metrics**
+          Metrics
           | Métrica | Valor |
           |---|---:|
-          | Throughput (RPS) | ${THR} |
+          | Throughput (RPS, Requests Per Second) | ${THR} |
           | P95 Latência (ms) | ${P95} |
           | Taxa de Erro (%) | ${ERR} |
           | Duração (s) | ${DUR} |
           | Pedidos totais | ${REQ} |
           MD
 
-     # 1) Criar Issue
+          # 1) Criar Issue
           CREATE_PAYLOAD=$(jq -n --arg p "$JIRA_PROJECT_KEY" --arg s "$SUMMARY" --arg d "$DESC" '{
             fields: {
               project: { key: $p },
@@ -373,7 +400,6 @@ jobs:
 
           echo "[JIRA] Comentário e anexo enviados."
 
-      
       # 5) Cleanup (corre sempre; tolerante em DEV)
       - name: Cleanup remote job
         if: always()
@@ -381,6 +407,5 @@ jobs:
           PERFORMANCE_HOME: ${{ github.workspace }}
         working-directory: ${{ github.workspace }}
         run: |
+          set -euo pipefail
           bash shell/cleanup-remote-job.sh "${LAC_ID}" "${TEST_ID}" "${VAULT_TOKEN}"
-
-
